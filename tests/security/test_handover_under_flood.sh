@@ -27,7 +27,7 @@ echo "── Scenario 5: Handover Under Flood (AC 3.2) ────────�
 cat > "$WORK/v1.flx" << 'FLX'
 prst int counter = 100
 int i = 0
-while i < 2000000000 { counter = counter + 1; i = i + 1 }
+while i < 2000000000 { counter = counter + 1  i = i + 1 }
 FLX
 
 # v2: counter has a different initial value (but prst survives handover)
@@ -35,7 +35,7 @@ cat > "$WORK/v2.flx" << 'FLX'
 prst int counter = 100
 prst str version = "v2"
 int i = 0
-while i < 2000000000 { counter = counter + 1; i = i + 1 }
+while i < 2000000000 { counter = counter + 1  i = i + 1 }
 FLX
 
 printf '[project]\nname="t"\nentry="v1.flx"\n' > "$WORK/fluxa.toml"

@@ -1,8 +1,8 @@
 # Fluxa-lang
 
-**v0.13.3 — Beta** · Hobby language · Rio de Janeiro, Brazil
+**v0.14 — Beta** · Hobby language · Rio de Janeiro, Brazil
 
-Fluxa is a statically-typed, C99-embedded scripting language designed for IoT and embedded systems (RP2040, ESP32). The runtime is now feature-complete and stable. 26 standard library modules available.
+Fluxa is a statically-typed, C99-embedded scripting language designed for IoT and embedded systems (RP2040, ESP32). Feature-complete and stable. 26 standard library modules. Three-tier execution: AST tree-walker → warm bytecode VM → compiled function bodies.
 
 ---
 
@@ -11,7 +11,7 @@ Fluxa is a statically-typed, C99-embedded scripting language designed for IoT an
 Four concrete capabilities drive the design:
 
 **1. Hot reload without downtime**
-Swap a running program's logic while all `prst` (persistent) variables survive. No restart, no lost state.
+Swap a running program's logic while all `prst` (persistent) variables survive.
 
 ```bash
 fluxa run main.flx -prod      # start in production mode
@@ -19,10 +19,10 @@ fluxa apply new_main.flx      # swap logic, state survives
 ```
 
 **2. Atomic Handover (5-step protocol)**
-Standby → Migrate → Dry Run → Switchover → Confirm. Runtime A stays active through steps 1–3. The state gap is measured in microseconds.
+Standby → Migrate → Dry Run → Switchover → Confirm. Runtime A stays active through steps 1–3. State gap is measured in microseconds.
 
 **3. Runtime Update Protocol**
-Replace the `./fluxa` binary itself with zero downtime. `prst` state survives the binary swap via snapshot + `execve`.
+Replace the `./fluxa` binary itself with zero downtime. `prst` state survives via snapshot + `execve`.
 
 ```bash
 fluxa update ./fluxa_v2       # replace binary, state preserved
@@ -57,24 +57,41 @@ str name = "fluxa"
 prst int counter = 0
 counter = counter + 1
 
-// danger — explicit error containment block
+// danger — explicit error containment
 danger {
     dyn r = httpc.get("http://api.example.com/temp")
-    int s = httpc.status(r)
-    str b = httpc.body(r)
-    print(s)
+    print(httpc.status(r))
 }
 if err != nil { print(err[0]) }
 
-// Blocks — lightweight objects
+// Blocks — lightweight objects with methods
 Block Sensor {
     float temp = 0.0
-    fn read() { temp = ffi.read_adc() }
+    fn read() nil { temp = 22.5 }
+    fn get() float { return temp }
 }
-Sensor s
+Block s typeof Sensor
 s.read()
-print(s.temp)
+print(s.get())
 ```
+
+---
+
+## Execution model (v0.14)
+
+Fluxa uses a three-tier system. Every function starts cold and promotes automatically:
+
+```
+Tier 0 — AST tree-walker      all functions, first 2 calls
+Tier 1 — Warm bytecode VM     promoted after 2 stable WHT runs
+           ├─ OP_GET_FIELD / OP_SET_FIELD  — Block field access (inline cache)
+           ├─ OP_CALL_METHOD               — Block method calls
+           └─ OP_CALL_FUNC                 — plain function calls
+Tier 2 — Compiled fn bodies   vm_run_fn with isolated register file
+           └─ fn with return expr compiled to OP_RETURN_VAL chunk
+```
+
+No configuration required. Promotion is automatic and transparent.
 
 ---
 
@@ -93,46 +110,43 @@ std.fs         = "1.0"   # read, write, listdir, mkdir (POSIX)
 std.zlib       = "1.0"   # deflate, gzip, crc32, adler32
 std.flxthread  = "1.0"   # native concurrency (pthreads)
 std.pid        = "1.0"   # PID controller (IoT/robotics)
-std.libv       = "1.0"   # vectors, matrices, tensors (GLM-style)
-std.libdsp     = "1.0"   # FFT, STFT, FIR/IIR, CFAR, range-Doppler
+std.libv       = "1.0"   # vectors, matrices, tensors
+std.libdsp     = "1.0"   # FFT, STFT, FIR/IIR filters
 std.crypto     = "1.0"   # BLAKE2b, XSalsa20, Ed25519 (libsodium)
 std.sqlite     = "1.0"   # embedded SQL
 std.serial     = "1.0"   # UART/serial (libserialport)
 std.i2c        = "1.0"   # I2C protocol (Linux)
-std.httpc      = "1.0"   # HTTP client, plain (libcurl)
+std.httpc      = "1.0"   # HTTP client (libcurl)
 std.https      = "1.0"   # HTTPS client, TLS enforced (libcurl)
 std.mqtt       = "1.0"   # MQTT client (libmosquitto)
-std.mcpc       = "1.0"   # MCP client, plain (libcurl)
+std.mcpc       = "1.0"   # MCP client (libcurl)
 std.mcps       = "1.0"   # MCP client, HTTPS enforced (libcurl)
-std.websocket  = "1.0"   # WebSocket client (native RFC6455 or libwebsockets)
+std.websocket  = "1.0"   # WebSocket client (pure C99 or libwebsockets)
 std.http       = "1.0"   # HTTP server + client (mongoose 7.21)
-std.mcp        = "1.0"   # Fluxa as MCP server, JSON-RPC 2.0 (mongoose)
-std.graph      = "1.0"   # 2D/3D graphics + input (stub or Raylib)
+std.mcp        = "1.0"   # Fluxa as MCP server (JSON-RPC 2.0)
+std.graph      = "1.0"   # 2D/3D graphics (stub or Raylib)
 std.infer      = "1.0"   # local LLM inference (stub or llama.cpp)
 ```
 
-**Optional backends** (compiled in when available, same API):
+**Optional backends:**
 
-| Lib | Default | Opt-in backend |
+| Lib | Default | Opt-in |
 |---|---|---|
-| `std.websocket` | pure C99 RFC6455, `ws://` | `make FLUXA_WS_LWS=1` → libwebsockets + TLS |
+| `std.websocket` | pure C99 RFC6455 | `make FLUXA_WS_LWS=1` → libwebsockets |
 | `std.libdsp` | pure C99 FFT | `[libs.libdsp] backend = "fftw"` → FFTW3 |
 | `std.libv` | pure C99 linear algebra | `[libs.libv] backend = "blas"` → OpenBLAS |
-| `std.graph` | stub (no-op, zero deps) | `make FLUXA_GRAPH_RAYLIB=1` → Raylib |
-| `std.infer` | stub (placeholder output) | `make FLUXA_INFER_LLAMA=1` → llama.cpp |
+| `std.graph` | stub (zero deps) | `make FLUXA_GRAPH_RAYLIB=1` → Raylib |
+| `std.infer` | stub (placeholder) | `make FLUXA_INFER_LLAMA=1` → llama.cpp |
 
 ---
 
-## Build-time control
+## Build targets
 
-`fluxa.libs` controls which libs enter the binary — critical for RP2040/ESP32 where binary size matters:
-
-```toml
-# fluxa.libs — build-time enable/disable (run: make build after changes)
-[libs.build]
-std.math      = true    # trig, sqrt, pow, log, clamp         (none)
-std.graph     = true    # 2D/3D graphics                       (none) [Raylib optional]
-std.sqlite    = false   # disabled — saves ~500KB on embedded
+```bash
+make build                    # standard binary
+make build-secure             # FLUXA_SECURE=1 — Ed25519 + IPC HMAC
+make build-sim-rp2040         # SRAM cap 264 KB (RP2040 simulation)
+make build-sim-esp32          # SRAM cap 520 KB (ESP32 simulation)
 ```
 
 ---
@@ -140,48 +154,33 @@ std.sqlite    = false   # disabled — saves ~500KB on embedded
 ## CLI
 
 ```
-fluxa run <file.flx>              run script (auto-detects mode)
-fluxa run <file.flx> -dev         dev mode: watch + auto-reload on save
+fluxa run <file.flx>              run script
+fluxa run <file.flx> -dev         dev mode: watch + auto-reload
 fluxa run <file.flx> -prod        prod mode: manual reload via IPC
 fluxa run <file.flx> -p           preflight: parse + resolve only
 fluxa apply <file.flx>            hot reload preserving prst state
-fluxa apply <file.flx> -p         preflight before applying
 fluxa handover <old> <new>        Atomic Handover (5-step protocol)
 fluxa update <new_binary>         Runtime Update Protocol
-fluxa update <new_binary> -p      preflight binary before sending
-fluxa observe <var>               stream prst variable live (IPC)
+fluxa observe <var>               stream prst variable live
 fluxa set <var> <value>           mutate prst variable in live runtime
-fluxa status                      runtime health snapshot
+fluxa status [<pid>]              runtime health snapshot
 fluxa logs                        last error entries
-fluxa explain                     all prst vars + dependency graph
+fluxa explain                     prst vars + dependency graph
 fluxa init <project>              scaffold new project
 fluxa dis <file.flx>              static analysis → .dis report
-fluxa keygen                      generate Ed25519 + HMAC keys (FLUXA_SECURE)
+fluxa keygen                      generate Ed25519 + HMAC keys
 ```
-
----
-
-## Security (FLUXA_SECURE)
-
-```bash
-make FLUXA_SECURE=1 build     # hardened build
-```
-
-Enables: script signing (Ed25519), IPC HMAC authentication, flood detection (RESCUE_MODE), connection rate limiting. All `fluxa update` calls require a `.sig` file alongside the new binary. See `docs/fluxa_spec_v13.md` §18 and `tests/security/README.md`.
 
 ---
 
 ## Testing
 
 ```bash
-make test-all                              # full suite (74 tests)
-FLUXA_TEST_HTTP=1  make test-all           # include live HTTP tests
-FLUXA_TEST_MQTT=1  make test-all           # include live MQTT tests
-FLUXA_TEST_I2C=1   make test-all           # include real I2C hardware
-FLUXA_TEST_SERIAL=1 make test-all          # include real serial hardware
-FLUXA_TEST_UPDATE=1 bash tests/sprint13/update_protocol.sh  # full update roundtrip
-bash tests/integration/run_all.sh          # integration scenario tests
-bash tests/integration/serial/run.sh       # Docker serial IO (tty0tty)
+make test-all                    # full suite: unit + suite2 + integration + sim
+make test-torture                # Docker: runtime under 0.1 CPU + 128 MB RAM
+make test-integration            # Atomic Handover scenarios only
+make test-sim                    # hardware simulation (RP2040 + ESP32)
+make bench                       # benchmark: loop, Block methods, field access
 ```
 
 ---
@@ -191,59 +190,60 @@ bash tests/integration/serial/run.sh       # Docker serial IO (tty0tty)
 ```
 fluxa/
 ├── src/
-│   ├── main.c           — CLI, command dispatch
-│   ├── lexer.c          — tokenizer
-│   ├── parser.c         — recursive descent parser
-│   ├── resolver.c       — symbol resolution, scope offsets
-│   ├── runtime.c        — tree-walking interpreter
-│   ├── handover.c       — Atomic Handover (5-step protocol)
-│   ├── ipc_server.c     — Unix socket IPC server (opcodes 0x01–0x07)
-│   ├── prst_pool.h      — persistent variable pool + serialization
-│   ├── scope.h          — value types, FluxaArr, FluxaDyn
-│   ├── fluxa_ipc.h      — IPC wire format + request builders
-│   ├── pool.h           — ASTPool arena (FLUXA_HUGEPAGES opt-in)
-│   └── std/             — 26 standard library modules
-│       ├── math/  csv/  json/  json2/  strings/  time/
-│       ├── fs/    zlib/  flxthread/  pid/  libv/  libdsp/
-│       ├── crypto/  sqlite/  serial/  i2c/
-│       ├── httpc/  https/  mqtt/  mcpc/  mcps/
-│       ├── websocket/  http/  mcp/
-│       ├── graph/       — 2D/3D (stub + Raylib)
-│       └── infer/       — LLM inference (stub + llama.cpp)
+│   ├── main.c             — CLI, command dispatch
+│   ├── lexer.c            — tokenizer
+│   ├── parser.c           — recursive descent parser
+│   ├── resolver.c         — symbol resolution, scope offsets
+│   ├── runtime.c          — tree-walker + bytecode VM orchestration
+│   ├── bytecode.c         — VM compiler + vm_run + vm_run_fn
+│   ├── bytecode.h         — opcodes, Chunk, vm_run signature
+│   ├── handover.c         — Atomic Handover (5-step protocol)
+│   ├── ipc_server.c       — Unix socket IPC server
+│   ├── fluxa_alloc.h      — hardware simulation allocator (RP2040/ESP32)
+│   ├── warm_profile.h     — WarmProfile: dynamic heap, WHT + QJL
+│   ├── prst_pool.h        — persistent variable pool + serialization
+│   ├── scope.h            — value types, FluxaArr, FluxaDyn
+│   ├── fluxa_ipc.h        — IPC wire format
+│   ├── pool.h             — ASTPool arena (FLUXA_HUGEPAGES opt-in)
+│   └── std/               — 26 standard library modules
 ├── tests/
-│   ├── run_tests.sh     — master runner (74 tests)
-│   ├── libs/            — one test script per stdlib lib
-│   ├── sprint13/        — Runtime Update Protocol tests
-│   ├── suite2/          — edge cases + integration (IoT scenarios)
-│   ├── security/        — FLUXA_SECURE hardening tests
-│   └── integration/     — Atomic Handover + serial Docker tests
+│   ├── run_tests.sh       — master runner (73 tests)
+│   ├── libs/              — one script per stdlib lib
+│   ├── suite2/            — edge cases + integration
+│   ├── security/          — FLUXA_SECURE hardening tests
+│   ├── integration/       — Atomic Handover + serial Docker tests
+│   ├── torture/           — IoT runtime simulation (Docker)
+│   ├── bench.flx          — 10M loop benchmark
+│   ├── bench_block.flx    — 1M Block method call benchmark
+│   └── bench_field.flx    — 1M direct Block field access benchmark
 ├── vendor/
-│   ├── mongoose.h       — mongoose 7.21 (vendored)
-│   └── mongoose.c
+│   ├── mongoose.h/.c      — mongoose 7.21 (vendored)
+│   └── uthash.h           — hash table (vendored)
 ├── docs/
-│   ├── fluxa_spec_v13.md  — language specification (v0.13.3)
+│   ├── fluxa_spec_v13.md  — language specification
 │   ├── STDLIB.md          — standard library reference
 │   ├── CHANGELOG.md       — version history
-│   ├── CREATING_LIBS.md   — guide for adding new libs
+│   ├── CREATING_LIBS.md   — guide for adding libs
 │   └── FLUXA_DIS.md       — disassembler reference
-├── fluxa.libs           — build-time library enable/disable
+├── fluxa.libs             — build-time library enable/disable
 └── Makefile
 ```
 
 ---
 
-## Status
-
-**Beta — v0.13.3**
+## Status — v0.14
 
 | Component | Status |
 |---|---|
 | Language (lexer, parser, resolver) | ✅ stable |
 | Runtime + GC | ✅ stable |
+| Bytecode VM (Phase 1–3) | ✅ stable |
 | Hot reload (`fluxa apply`) | ✅ stable |
 | Atomic Handover (5-step) | ✅ stable |
-| IPC server (7 opcodes) | ✅ stable |
+| IPC server | ✅ stable |
 | Prod mode + FLUXA_SECURE | ✅ stable |
 | Runtime Update Protocol | ✅ stable |
 | Standard library (26 libs) | ✅ stable |
+| Hardware simulation (RP2040/ESP32) | ✅ stable |
+| Docker torture testing | ✅ stable |
 | Huge Pages (`FLUXA_HUGEPAGES=1`) | ✅ opt-in |

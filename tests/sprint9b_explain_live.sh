@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Torture mode: multiply waits by TORTURE_WAIT when FLUXA_TORTURE=1
+TORTURE_WAIT="${FLUXA_TORTURE:+5}"
+TORTURE_WAIT="${TORTURE_WAIT:-1}"
 # tests/sprint9b_explain_live.sh — Sprint 9.b Issue #96: fluxa explain via IPC
 #
 # Validates both modes of the explain command:
@@ -37,7 +40,7 @@ mkdir -p "$WORK_DIR"
 
 # Limpa sockets/locks stale de runs anteriores
 kill -9 $(pgrep -x fluxa 2>/dev/null) 2>/dev/null || true
-sleep 0.1
+sleep $(echo "0.1 * $TORTURE_WAIT" | bc)
 rm -f /tmp/fluxa-*.sock /tmp/fluxa-*.lock 2>/dev/null || true
 
 cleanup() {
@@ -53,9 +56,9 @@ vlog() { [[ $VERBOSE -eq 1 ]] && echo "        $*" || true; }
 
 wait_for_socket() {
     local pid="$1"
-    for i in $(seq 1 30); do
+    for i in $(seq 1 $(( 30 * TORTURE_WAIT ))); do
         [[ -S "/tmp/fluxa-${pid}.sock" ]] && return 0
-        sleep 0.1
+        sleep $(echo "0.1 * $TORTURE_WAIT" | bc)
     done
     return 1
 }
@@ -95,7 +98,7 @@ fi
 kill -9 "$RT_PID" 2>/dev/null || true
 wait "$RT_PID" 2>/dev/null || true
 RT_PID=""
-sleep 0.3
+sleep $(echo "0.3 * $TORTURE_WAIT" | bc)
 rm -f /tmp/fluxa-*.sock /tmp/fluxa-*.lock 2>/dev/null || true
 
 # =============================================================================
@@ -120,16 +123,16 @@ RT_PID=$!
 if ! wait_for_socket "$RT_PID"; then
     fail "caso2/set_in_prod_loop" "socket não apareceu"
 else
-    sleep 0.5
+    sleep $(echo "0.5 * $TORTURE_WAIT" | bc)
 
     set_out=$("$FLUXA" set number 99 2>&1 || true)
     vlog "set output: $set_out"
 
-    sleep 0.8
+    sleep $(echo "0.8 * $TORTURE_WAIT" | bc)
 
     # observe prints on first read; head -1 exits after first line,
     # which causes SIGPIPE to fluxa — that is intentional and harmless.
-    obs_out=$(timeout 3s "$FLUXA" observe number 2>/dev/null | head -1 || true)
+    obs_out=$(timeout $(echo "3 * $TORTURE_WAIT" | bc)s "$FLUXA" observe number 2>/dev/null | head -1 || true)
     vlog "observe: $obs_out"
 
     if echo "$obs_out" | grep -q "= 99"; then
@@ -143,7 +146,7 @@ fi
 kill -9 "$RT_PID" 2>/dev/null || true
 wait "$RT_PID" 2>/dev/null || true
 RT_PID=""
-sleep 0.3
+sleep $(echo "0.3 * $TORTURE_WAIT" | bc)
 rm -f /tmp/fluxa-*.sock /tmp/fluxa-*.lock 2>/dev/null || true
 
 # =============================================================================
@@ -171,7 +174,7 @@ RT_PID=$!
 if ! wait_for_socket "$RT_PID"; then
     fail "caso3/explain_live_socket" "socket não apareceu"
 else
-    sleep 0.4
+    sleep $(echo "0.4 * $TORTURE_WAIT" | bc)
 
     explain_out=$("$FLUXA" explain 2>&1 || true)
     vlog "explain output: $explain_out"
@@ -219,7 +222,7 @@ fi
 kill -9 "$RT_PID" 2>/dev/null || true
 wait "$RT_PID" 2>/dev/null || true
 RT_PID=""
-sleep 0.2
+sleep $(echo "0.2 * $TORTURE_WAIT" | bc)
 
 # =============================================================================
 # CASO 4 — fluxa explain <file> (modo 2 — comportamento original mantido)

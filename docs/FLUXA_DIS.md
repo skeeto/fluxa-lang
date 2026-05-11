@@ -1,20 +1,18 @@
 # fluxa dis — Fluxa Program Disassembler
 
-**v0.13.x — stable**
+**v0.14 — stable**
 
 `fluxa dis` is a standalone static analysis command. It parses and resolves
 a Fluxa program without executing it, then writes a human-readable report
 file (`<program>.dis`) covering seven sections:
 
 1. **AST structure** — every node: type, source line, `warm_local` flag, `resolved_offset`.
-2. **Warm path forecast** — PROMOTABLE or COLD-LOCKED per function, cold bytes/read vs warm bytes/read.
-3. **Hot path bytecode** — VM instructions for `while`/`if` bodies in warm functions.
+2. **Warm path forecast** — PROMOTABLE per function, bytes/read at each tier.
+3. **Hot path bytecode** — VM instructions for compiled loops and function bodies.
 4. **Call order** — call graph, recursive calls, mutual recursion (DFS), topological order.
 5. **prst fork** — persistent variables, declared types, dependency graph.
 6. **Execution paths** — per-function tier summary: Tier 0/1/2 eligibility, bytes/read, TCO.
-7. **Statistics** — AST nodes, functions, WarmProfile budget, VM eligibility.
-4. **Execution path summary** — per function: which tier it is likely to reach,
-   memory touched per read (bytes), and the bytecode VM eligibility for hot paths.
+7. **Statistics** — AST nodes, functions, WarmProfile usage, VM eligibility.
 
 ---
 
@@ -83,9 +81,9 @@ the source and writing the output file.
 ── 4. Execution Path Summary ────────────────────────────────────
 
   fn fib
-    tier 0 (cold):   calls 1–4          418B/read (0 prst vars)
-    tier 1 (warm):   calls 5+           9B/read   after promotion
-    tier 2 (hot VM): not applicable     (no while/if compiled to bytecode)
+    tier 0 (cold):   call 1             418B/read (0 prst vars)
+    tier 1 (warm):   call 2+            9B/read   after promotion (2 stable runs)
+    tier 2 (fn VM):  vm_run_fn chunk    compiled fn body if body is inlinable
     TCO:             yes — tail position detected at line 3
 
   [top-level]
@@ -100,7 +98,7 @@ the source and writing the output file.
   Blocks:              0
   prst vars:           0
   warm candidates:     1 / 1  (100%)
-  WarmProfile budget:  1 × 276B = 276B  (of 8704B max)
+  WarmProfile:         1 fn × 276B = 276B  (dynamic heap, grows on demand)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
@@ -153,13 +151,12 @@ The static forecast uses conservative inference:
 | Pattern | Forecast |
 |---|---|
 | All params typed `int` or `float`, no dyn locals | PROMOTABLE |
-| Any param or local typed `dyn` | COLD-LOCKED (type not stable) |
+| Any param or local typed `dyn` | NOTE: may reduce warm promotion rate |
 | Function body accesses `prst` var | COLD-LOCKED (prst read goes through pool) |
 | Function calls Block method | NOTE: callee is cold; caller unaffected |
 | Recursive function | PROMOTABLE if base param is typed scalar |
 | TCO target same function | PROMOTABLE — same WarmFunc slot |
 | TCO target different function | each function profiled independently |
-| > 32 functions in program | functions beyond slot 32 → cold fallback noted |
 | > 256 locals in one function | slot wrap noted — may reduce promotion rate |
 
 ---
@@ -231,7 +228,8 @@ fluxa dis fib.flx --json         → fib.dis.json
     "functions": 1,
     "warm_candidates": 1,
     "warm_profile_bytes": 276,
-    "warm_profile_max": 8704
+    "warm_profile_bytes_used": 276,
+    "warm_profile_dynamic": true
   }
 }
 ```

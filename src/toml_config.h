@@ -29,27 +29,27 @@
 #endif
 
 /* ── FFI entry from toml ──────────────────────────────────────────────────── */
-#define TOML_FFI_MAX       32   /* max libs in [ffi]                         */
-#define TOML_SIG_MAX       64   /* max signatures per lib                    */
-#define TOML_SIG_PARAM_MAX 16   /* max params per signature                  */
+#define TOML_FFI_MAX        8   /* max libs in [ffi]       — was 32, ~4× reduction */
+#define TOML_SIG_MAX       32   /* max signatures per lib  — was 64, ~2× reduction */
+#define TOML_SIG_PARAM_MAX 16   /* max params per signature — unchanged */
 
 /* Single param descriptor — carries C type string, e.g. "int*", "char*" */
 typedef struct {
-    char c_type[32];   /* "int", "int*", "double*", "char*", "void*", etc. */
+    char c_type[16];   /* "int", "int*", "double*", "char*", "void*", etc. */
 } FfiParamDesc;
 
 /* One function signature from [ffi.<lib>.signatures] */
 typedef struct {
-    char         fn_name[128];
-    char         ret_type[32];
+    char         fn_name[64];
+    char         ret_type[16];
     FfiParamDesc params[TOML_SIG_PARAM_MAX];
     int          param_count;
 } FfiSigEntry;
 
 /* One lib declared in [ffi] */
 typedef struct {
-    char        alias[128];          /* key in toml, e.g. "libm"          */
-    char        path[256];           /* "auto" or explicit path            */
+    char        alias[64];           /* key in toml, e.g. "libm"          */
+    char        path[128];           /* "auto" or explicit path            */
     FfiSigEntry sigs[TOML_SIG_MAX];
     int         sig_count;
 } TomlFfiEntry;
@@ -117,25 +117,26 @@ typedef struct {
 } FluxaConfig;
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
+/* Fill FluxaConfig with defaults via pointer — avoids 1.4MB on C stack. */
+static inline void fluxa_config_defaults_fill(FluxaConfig *c) {
+    memset(c, 0, sizeof(*c));
+    c->gc_cap         = GC_TABLE_CAP;
+    c->prst_cap       = PRST_POOL_INIT_CAP;
+    c->prst_graph_cap = PRST_GRAPH_CAP_DEFAULT;
+    c->warm_func_cap  = 32;
+    c->json_max_str      = 4096;
+    c->ffi_str_buf_size  = 1024;
+    strncpy(c->libdsp_backend, "native", sizeof(c->libdsp_backend)-1);
+    strncpy(c->libv_backend,   "native", sizeof(c->libv_backend)-1);
+    c->security.mode = FLUXA_SEC_MODE_OFF;
+    c->security.signing_key_path[0]  = '\0';
+    c->security.ipc_hmac_key_path[0] = '\0';
+    c->security.handshake_timeout_ms = 50;
+    c->security.ipc_max_conns        = 16;
+}
+/* Wrapper returning by value — only safe to call from heap-allocated context */
 static inline FluxaConfig fluxa_config_defaults(void) {
-    FluxaConfig c;
-    memset(&c, 0, sizeof(c));
-    /* std_libs: all disabled by default — must be declared in [libs] */
-    c.gc_cap         = GC_TABLE_CAP;
-    c.prst_cap       = PRST_POOL_INIT_CAP;
-    c.prst_graph_cap = PRST_GRAPH_CAP_DEFAULT;
-    c.warm_func_cap  = 32;  /* WARM_FUNC_CAP_DEFAULT */
-    c.json_max_str      = 4096;
-    c.ffi_str_buf_size  = 1024;
-    strncpy(c.libdsp_backend, "native", sizeof(c.libdsp_backend)-1);
-    strncpy(c.libv_backend,   "native", sizeof(c.libv_backend)-1);
-    /* security: off by default — must be explicitly enabled in [security] */
-    c.security.mode = FLUXA_SEC_MODE_OFF;
-    c.security.signing_key_path[0]  = '\0';
-    c.security.ipc_hmac_key_path[0] = '\0';
-    c.security.handshake_timeout_ms = 50;   /* IPC_TIMEOUT_MS default */
-    c.security.ipc_max_conns        = 16;   /* IPC_MAX_CONNS_DEFAULT  */
-    return c;
+    FluxaConfig c; fluxa_config_defaults_fill(&c); return c;
 }
 
 static inline char *cfg_trim(char *s) {
@@ -165,7 +166,7 @@ static inline void cfg_parse_sig(const char *sig_str, FfiSigEntry *out) {
     /* ret type: everything after " -> " */
     const char *arrow = strstr(sig_str, "->");
     if (arrow) {
-        char ret[32];
+        char ret[16];
         snprintf(ret, sizeof(ret), "%s", cfg_trim((char*)(arrow + 2)));
         snprintf(out->ret_type, sizeof(out->ret_type), "%s", ret);
     } else {
@@ -218,7 +219,8 @@ static inline TomlFfiEntry *cfg_ffi_find_or_create(
 
 /* ── Main parser ──────────────────────────────────────────────────────────── */
 static inline FluxaConfig fluxa_config_load(const char *path) {
-    FluxaConfig cfg = fluxa_config_defaults();
+    FluxaConfig cfg;
+    fluxa_config_defaults_fill(&cfg);
     if (!path) return cfg;
 
     FILE *f = fopen(path, "r");
@@ -294,15 +296,12 @@ static inline FluxaConfig fluxa_config_load(const char *path) {
             } else if (strcmp(key, "prst_graph_cap") == 0) {
                 if (v > 0 && v <= PRST_GRAPH_CAP_MAX) cfg.prst_graph_cap = v;
             } else if (strcmp(key, "warm_func_cap") == 0) {
-                /* Must be power of 2 in [4, 256]. Round down to nearest pow2. */
-                if (v >= 4 && v <= 256) {
+                /* Initial hash table capacity — grows automatically via realloc.
+                 * Any positive value accepted; rounded up to next power of 2. */
+                if (v > 0) {
                     int p = 4;
-                    while (p * 2 <= v) p *= 2;
+                    while (p < v) p *= 2;
                     cfg.warm_func_cap = p;
-                } else {
-                    fprintf(stderr,
-                        "[fluxa] toml: warm_func_cap %d out of range [4,256]"
-                        " — using default 32\n", v);
                 }
             }
             continue;
@@ -375,7 +374,7 @@ static inline FluxaConfig fluxa_config_load(const char *path) {
                     " keeping default %d\n", v, cfg.ffi_str_buf_size);
                 continue;
             }
-            char resolved[256];
+            char resolved[128];
             cfg_unquote(val, resolved, sizeof(resolved));
             TomlFfiEntry *e = cfg_ffi_find_or_create(&cfg, key);
             if (e) snprintf(e->path, sizeof(e->path), "%s", resolved);

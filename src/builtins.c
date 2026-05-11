@@ -167,3 +167,45 @@ Value builtin_dispatch(struct Runtime *rt, ASTNode *call, EvalFn eval_fn) {
     if (strcmp(name, "str_alloc") == 0) return builtin_str_alloc(rt, call, eval_fn);
     return val_nil();
 }
+
+/* ── Pre-evaluated variant — used by vm_call_callback (OP_CALL_FUNC) ─────── */
+/* Args are already evaluated Values from VM registers. No ASTNode needed.  */
+Value builtin_dispatch_values(struct Runtime *rt, const char *name,
+                               Value *args, int argc) {
+    if (strcmp(name, "print") == 0) {
+        if (!rt->dry_run) {
+            for (int i = 0; i < argc; i++) {
+                print_value(args[i]);
+                if (i < argc - 1) printf(" ");
+            }
+            printf("\n");
+        }
+        return val_nil();
+    }
+    if (strcmp(name, "len") == 0) {
+        if (argc != 1) { rt->had_error = 1; return val_nil(); }
+        Value v = args[0];
+        if (v.type == VAL_STRING) return val_int(v.as.string ? (long)strlen(v.as.string) : 0);
+        if (v.type == VAL_ARR)   return val_int(v.as.arr.size);
+        if (v.type == VAL_DYN && v.as.dyn) return val_int(v.as.dyn->count);
+        return val_int(0);
+    }
+    if (strcmp(name, "input") == 0) {
+        if (argc > 0 && args[0].type == VAL_STRING && args[0].as.string)
+            printf("%s", args[0].as.string);
+        char buf[1024]; buf[0] = '\0';
+        if (fgets(buf, sizeof(buf), stdin)) {
+            int n = (int)strlen(buf);
+            if (n > 0 && buf[n-1] == '\n') buf[n-1] = '\0';
+        }
+        return val_string(buf);
+    }
+    if (strcmp(name, "input_int") == 0) {
+        char buf[64];
+        if (!fgets(buf, sizeof(buf), stdin)) return val_int(0);
+        return val_int((long)atol(buf));
+    }
+    /* str_alloc not needed from VM — falls through to error */
+    rt->had_error = 1;
+    return val_nil();
+}

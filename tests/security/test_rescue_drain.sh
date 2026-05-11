@@ -31,7 +31,7 @@ echo "── Scenario 4: RESCUE_MODE Auto-Drain (AC 2.2) ───────�
 cat > "$WORK/main.flx" << 'FLX'
 prst int x = 0
 int i = 0
-while i < 2000000000 { x = x + 1; i = i + 1 }
+while i < 2000000000 { x = x + 1  i = i + 1 }
 FLX
 printf '[project]\nname="t"\nentry="main.flx"\n' > "$WORK/fluxa.toml"
 

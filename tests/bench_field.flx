@@ -1,0 +1,27 @@
+// bench_field.flx — Block field direct read/write in VM (v0.14 Fase 2/3)
+// OP_GET_FIELD + OP_SET_FIELD: acesso direto a campos Block no bytecode VM.
+// Sem chamada de método — sem call_function, sem frame save/restore.
+
+Block Acumulador {
+    int total = 0
+}
+
+Block c typeof Acumulador
+
+// Cenário 1: escrita e leitura de campo — 1M iterações, 2 ops por iter
+int i = 0
+while i < 1000000 {
+    c.total = c.total + i
+    i = i + 1
+}
+print(c.total)   // 499999500000
+
+// Cenário 2: campo como condição do while
+Block Flag { int ativo = 1 }
+Block f typeof Flag
+int cont = 0
+while f.ativo == 1 {
+    cont = cont + 1
+    if cont >= 5 { f.ativo = 0 }
+}
+print(cont)  // 5

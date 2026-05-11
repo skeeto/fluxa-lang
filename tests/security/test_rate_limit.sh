@@ -8,6 +8,7 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 FLUXA="${ROOT}/fluxa_secure"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"; kill "$RT_PID" 2>/dev/null || true' EXIT
+RT_PID=0
 FAILS=0
 
 pass() { printf "  PASS  security/%s\n" "$1"; }
@@ -24,7 +25,7 @@ start_runtime() {
     cat > "$WORK/main.flx" << 'FLX'
 prst int x = 0
 int i = 0
-while i < 2000000000 { x = x + 1; i = i + 1 }
+while i < 2000000000 { x = x + 1  i = i + 1 }
 FLX
     printf '[project]\nname="t"\nentry="main.flx"\n' > "$WORK/fluxa.toml"
     "$FLUXA" run "$WORK/main.flx" -proj "$WORK" -prod \

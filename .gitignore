@@ -9,6 +9,8 @@ fluxa_debug
 fluxa-rp2040
 fluxa-esp32
 fluxa-cortex-m
+fluxa_sim_esp32
+fluxa_sim_rp2040
 *.o
 *.elf
 *.uf2
@@ -25,3 +27,10 @@ fluxa-cortex-m
 *.swp
 *.swo
 .DS_Store
+-e 
+fluxa_dis
+fluxa_dbg
+fluxa_asan
+*.dis
+fluxa_secure
+fluxa_dis

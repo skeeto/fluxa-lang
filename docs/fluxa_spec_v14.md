@@ -2,7 +2,7 @@
 
 **Technical Specification**
 
-**v0.13.3 — Beta**
+**v0.14 — Beta**
 
 *Runtime · Hot Reload · Atomic Handover · Runtime Update Protocol · 26 stdlib libs*
 
@@ -683,7 +683,7 @@ fluxa_dis examples/problems/07_dijkstra.flx
 | **4. Call Order** | Call graph per function: direct calls, recursive calls, mutual recursion (DFS cycle detection), topological order for DAG programs. |
 | **5. prst Fork** | All `prst` vars with owner and line. Shows what state dies atomically if each var is removed. |
 | **6. Execution Paths** | Per-function tier summary: Tier 0/1/2 eligibility, bytes/read, TCO flag. |
-| **7. Statistics** | Total AST nodes, functions (promotable / cold-locked / beyond cap), WarmProfile budget used vs max, VM eligibility, TCO presence. |
+| **7. Statistics** | Total AST nodes, functions (promotable), WarmProfile heap usage, VM eligibility, TCO presence. |
 
 **Build:**
 
@@ -904,7 +904,7 @@ typedef struct Runtime {
     int            current_line;     // line currently executing
 
     // Sprint 11 — warm path
-    WarmProfile    warm;             // compact execution profile (8.7 KB max)
+    WarmProfile    warm;             // compact execution profile (dynamic heap, power-of-2 growth)
     ASTNode       *current_fn;       // ASTNode* of current function (warm key)
     WarmFunc      *current_wf;       // cached WarmFunc — set once per call_function entry
 } Runtime;
@@ -953,7 +953,7 @@ typedef struct {
 | PrstGraph | dynamic | Initial cap via prst_graph_cap, max 65536 |
 | ASTPool nodes | 4096 nodes | Parse arena — batch free at end |
 | ASTPool strings | 64 KB | Interned string buffer |
-| WarmProfile | 8.7 KB max | 32 functions × 276 bytes; zero malloc per call |
+| WarmProfile | dynamic heap | starts at warm_func_cap × 276B, doubles at 75% fill |
 | WarmSlot | 1 byte/node | 3-bit type + 1-bit QJL guard + 4-bit obs counter |
 | warm_local flag | 1 byte/ASTNode | Set by resolver; skips prst_pool_has for fn-local vars |
 
@@ -969,7 +969,7 @@ The insight transferred to Fluxa: a function's execution state is a vector of ty
 
 **Tier 0 — Cold (first 4 calls):** full AST walker. The resolver has already set `warm_local=1` on every `NODE_IDENTIFIER` inside a fn body (`in_func_depth > 0`, not `prst`), which skips `prst_pool_has` (O(n) strcmp scan) even in cold mode. The runtime records the observed ValType (3 bits) of each stack slot into the function's `WarmFunc`.
 
-Observation caps at `WARM_OBS_LIMIT = 4` calls. After 4 calls: either promoted (Tier 1) or cold-locked permanently. Cold-locked functions have zero overhead — just the warm_local direct stack read.
+Observation runs until promotion — no cap, no cold-lock. Fluxa is strongly typed; types never change at runtime. After 2 consecutive stable WHT runs, the function promotes to Tier 1. Block methods also promote (the `current_instance == NULL` gate was removed in v0.14).
 
 **Tier 1 — Warm (stable_runs ≥ 2):** promoted functions skip ASTNode traversal entirely. Per `rt_get`:
 
@@ -979,7 +979,7 @@ Observation caps at `WARM_OBS_LIMIT = 4` calls. After 4 calls: either promoted (
 4. QJL residual: if `warm_type_from_val_type(v.type) == ws->observed_type` → return. **9 bytes total.**
 5. On type mismatch: QJL guard fires, `stable_runs` reset, function demoted to Tier 0
 
-**Tier 2 — Hot (bytecode VM):** `while` and `if` loops compiled to 3-address register bytecode. Unchanged by Sprint 11.
+**Tier 2 — Hot (bytecode VM):** `while` and `if` loops compiled to 3-address register bytecode. In v0.14, function bodies with `return expr` also compile to bytecode chunks via `vm_run_fn` with an isolated register file — no frame save/restore.
 
 #### Key implementation details
 
@@ -991,7 +991,7 @@ Observation caps at `WARM_OBS_LIMIT = 4` calls. After 4 calls: either promoted (
 
 **Block methods excluded:** `current_instance != NULL` in Block method frames → warm path disabled. Block methods use `inst->scope`, not the stack-slot path, so `warm_local` would be incorrect.
 
-**Hash table (WarmProfile):** Open-addressing hash keyed by `(uintptr_t)fn_node` — the ASTNode pointer is stable across all calls to the same function. The static array holds `WARM_FUNC_CAP_MAX = 256` slots; the runtime uses only `warm_func_cap` of them (default 32, configurable via `fluxa.toml [runtime]`). Power of 2 required for fast modulo. When the active cap is exhausted, `warm_profile_get_func` returns NULL — the function silently falls back to the warm_local direct stack read. Setting `warm_func_cap = 64` doubles the profiling budget to 17.6 KB at zero additional code cost.
+**Hash table (WarmProfile):** Open-addressing hash keyed by `(uintptr_t)fn_node` — the ASTNode pointer is stable across all calls to the same function. The table is a single contiguous heap-allocated `WarmFunc[]` block, starting at `warm_func_cap` entries (default 32) and growing via `realloc × 2` when > 75% full. `warm_func_cap` in `fluxa.toml` sets the **initial** capacity — not a ceiling. One pointer indirection total; all WarmFuncs are contiguous for cache locality.
 
 **Slot wrap:** Functions with more than `WARM_SLOTS_MAX = 256` local variables wrap their slot index (`slot_idx % 256`). Colliding slots with different observed types cause the QJL guard to fire, keeping the function cold-locked. The direct stack read via warm_local still works correctly in all cases.
 
@@ -1213,7 +1213,8 @@ synchronized via the pool's own lock, not via the GC.
 | 9 | ✅ | Full CLI: fluxa run/apply/handover/observe/set/logs/status/init, IPC unix socket, preflight (-p), --force, fluxa.toml [libs] |
 | 9.c | ✅ | FFI pointer type mapping: int\*, double\*, bool\* → &var writeback; char\* → writable buffer; uint8_t\* → arr byte scatter; dyn → opaque void\* round-trip. str_buf_size configurable via [ffi] (default 1024). Improved error messages for json/csv. All source strings in English. |
 | 10 | ✅ | std.math, std.csv, std.json, std.strings, std.time, std.flxthread (native concurrency). All opt-in via fluxa.toml [libs]. |
-| 11 | ✅ | Warm Path execution tier: warm_local resolver flag; WarmProfile (8.7 KB) with WHT path signature + QJL 1-bit guard per slot; O(1) hash keyed by fn_node\*; observation capped at 4 calls; promoted reads touch 9B vs 418B+ cold. fib +21%, block calls +12%, PROJECT mode +23%. Zero regression on VM. First use of TurboQuant-inspired quantization in a language runtime. |
+| 11 | ✅ | Warm Path: warm_local flag; WarmProfile (WHT + QJL); promoted reads 9B vs 418B+ cold. fib +21%, block calls +12%. TurboQuant-inspired. |
+| 14 | ✅ | Performance Sprint: WarmProfile dynamic heap (no cap, no cold-lock). OP_CALL_METHOD, OP_CALL_FUNC, OP_GET_FIELD, OP_SET_FIELD. Instance inline cache (VAL_STRING→VAL_PTR). method_try_inline. vm_run_fn / chunk_compile_fn. Hardware sim (RP2040/ESP32). Docker torture. bench_field 94% faster. |
 | 12.a | ✅ | std.crypto (libsodium 1.0.18+): BLAKE2b-256, XSalsa20-Poly1305, Ed25519, Curve25519. `fluxa keygen` CLI. `[security]` toml. FLUXA\_SECURE=1: two-level RESCUE (SOFT/HARD). Silent drop. Configurable `handshake_timeout_ms`, `ipc_max_conns`. Bug fixes: arr return UAF, resolver stack overflow. |
 | 12.b | ✅ | **Libs 1** — std.pid, std.sqlite, std.serial, std.i2c. **Lib Linker** — FLUXA_LIB_EXPORT macro + gen_lib_registry.py + lib.mk: new libs need zero runtime.c/parser.c/toml edits. **fluxa.libs** — build-time binary control. **fluxa init** — generates full project structure (main.flx, fluxa.toml, fluxa.libs, live/, static/, tests/). |
 | 12.c | ✅ | **Huge Pages** — `FLUXA_HUGEPAGES=1` via `madvise(MADV_HUGEPAGE)` on AST arena arrays. Reduces dTLB pressure on RAM-intensive workloads. See §20 for when to enable. |

@@ -1,6 +1,7 @@
 /* bytecode.h — Fluxa Bytecode VM (Sprint 4 performance)
  * Issue #32: implementation moved to bytecode.c
  * Issue #33: next_reg is now uint16_t (was uint8_t — silent overflow at 128)
+ * v0.14: OP_CALL_METHOD and OP_CALL_FUNC — Block methods and fns in the VM
  */
 #ifndef FLUXA_BYTECODE_H
 #define FLUXA_BYTECODE_H
@@ -21,8 +22,49 @@ typedef enum {
     OP_EQ, OP_NEQ, OP_LT, OP_GT, OP_LTE, OP_GTE,
     OP_JUMP_IF_FALSE,
     OP_JUMP,
-    OP_RETURN
+    OP_RETURN,
+    /* v0.14: call opcodes — bridge VM back to runtime C via callback ───── */
+    /* OP_CALL_METHOD: inst.method(args)
+     *   a      = dest register for return value
+     *   b      = constants[] index → VAL_STRING owner name
+     *   c      = constants[] index → VAL_STRING method name
+     *   offset = (first_arg_reg << 8) | arg_count  (each fits in 8 bits) */
+    OP_CALL_METHOD,
+    /* OP_CALL_FUNC: fn(args)
+     *   a      = dest register for return value
+     *   b      = constants[] index → VAL_STRING function name
+     *   c      = first arg register
+     *   offset = arg_count */
+    OP_CALL_FUNC,
+    /* OP_GET_FIELD: R[a] = inst.field  (Block field read)
+     *   a = dest register
+     *   b = constants[] index → VAL_STRING owner name
+     *   c = constants[] index → VAL_STRING field name   */
+    OP_GET_FIELD,
+    /* OP_SET_FIELD: inst.field = R[a]  (Block field write)
+     *   a = src register (value to write)
+     *   b = constants[] index → VAL_STRING owner name
+     *   c = constants[] index → VAL_STRING field name   */
+    OP_SET_FIELD,
+    /* OP_RETURN_VAL: return a value from a compiled function body.
+     *   a = register holding return value.
+     * OP_RETURN_NIL: return nil (void functions).
+     * Both terminate vm_run_fn execution.                              */
+    OP_RETURN_VAL,
+    OP_RETURN_NIL
 } Opcode;
+
+/* ── Call callback — passed to vm_run; bridges back to runtime C ─────────── */
+/* owner_kv: NULL for plain function (OP_CALL_FUNC).
+ *           For OP_CALL_METHOD: pointer to c->constants[b] — mutable so
+ *           callback can patch VAL_STRING→VAL_PTR(BlockInstance*) inline cache.
+ * args: pointer directly into R[first_arg] — NO copy, NO malloc in VM.
+ *       Callback must NOT store this pointer past its return. */
+typedef Value (*vm_call_cb_t)(void       *rt_opaque,
+                               Value      *owner_kv,
+                               const char *method_or_func,
+                               Value      *args,
+                               int         argc);
 
 /* ── Instruction (3-address register-based) ──────────────────────────────── */
 typedef struct {
@@ -30,7 +72,7 @@ typedef struct {
     uint16_t a;       /* dest register    — Issue #33: uint16_t */
     uint16_t b;       /* src1 / const idx — Issue #33: uint16_t */
     uint16_t c;       /* src2 register    — Issue #33: uint16_t */
-    int      offset;  /* jump target */
+    int      offset;  /* jump target / arg encoding */
 } Instruction;
 
 /* ── Chunk — compiled bytecode ───────────────────────────────────────────── */
@@ -103,9 +145,41 @@ static inline int chunk_add_const_str(Chunk *c, const char *sval) {
 
 /* ── Public API (implemented in bytecode.c) ──────────────────────────────── */
 int chunk_compile_loop(Chunk *c, ASTNode *loop_node);
-/* cancel_flag: NULL for normal execution; set *cancel_flag=1 from another
- * thread to break out of a long-running VM loop (used by -dev watcher). */
+/* Compile a function body — uses OP_RETURN_VAL / OP_RETURN_NIL.
+ * Params are at resolved_offset 0..param_count-1 in the register file. */
+int chunk_compile_fn(Chunk *c, ASTNode *fn_node);
+
+/* cancel_flag: NULL for normal; set *cancel_flag=1 to abort (used by -dev).
+ * call_cb / rt_opaque: dispatch OP_CALL_METHOD / OP_CALL_FUNC to runtime C.
+ * tick_cb: called at every OP_JUMP back-edge alongside cancel_flag check.
+ *   Used by runtime for GC sweep and mailbox processing. NULL = no tick.
+ *   Signature: void tick_cb(void *rt_opaque)                              */
+typedef void (*vm_tick_cb_t)(void *rt_opaque);
+
+/* Field access callbacks for OP_GET_FIELD / OP_SET_FIELD.
+ * owner_kv: pointer to c->constants[b] — mutable so the callback can patch
+ * it from VAL_STRING("c1") to VAL_PTR(BlockInstance*) on first call.
+ * Subsequent calls skip resolve_instance entirely (O(1) pointer deref).
+ * NULL = no field access support (loop has no Block field ops).           */
+typedef Value (*vm_get_field_cb_t)(void *rt, Value *owner_kv, const char *field);
+typedef void  (*vm_set_field_cb_t)(void *rt, Value *owner_kv, const char *field, Value val);
+
+/* vm_run_fn: execute a compiled function body chunk.
+ * fn_stack: pre-allocated register file with params at [0..param_count-1].
+ * Returns the value from OP_RETURN_VAL, or VAL_NIL for OP_RETURN_NIL/end.
+ * Separate from vm_run: no Scope*, no tick_cb, no field callbacks needed. */
+Value vm_run_fn(Chunk *c, Value *fn_stack, int fn_stack_size,
+                vm_call_cb_t      call_cb,
+                vm_get_field_cb_t get_field_cb,
+                vm_set_field_cb_t set_field_cb,
+                void             *rt_opaque);
+
 int vm_run(Chunk *c, Scope *scope, Value *stack_ptr, int stack_size,
-           volatile int *cancel_flag);
+           volatile int *cancel_flag,
+           vm_call_cb_t      call_cb,
+           void             *rt_opaque,
+           vm_tick_cb_t      tick_cb,
+           vm_get_field_cb_t get_field_cb,
+           vm_set_field_cb_t set_field_cb);
 
 #endif /* FLUXA_BYTECODE_H */

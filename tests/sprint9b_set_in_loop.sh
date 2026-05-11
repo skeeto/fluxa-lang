@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Torture mode: multiply waits by TORTURE_WAIT when FLUXA_TORTURE=1
+TORTURE_WAIT="${FLUXA_TORTURE:+5}"
+TORTURE_WAIT="${TORTURE_WAIT:-1}"
 # tests/sprint9b_set_in_loop.sh — Sprint 9.b Issue #95
 #
 # Validates that fluxa set works inside infinite while loops.
@@ -40,7 +43,7 @@ fail() { echo "  FAIL  $1"; FAIL=$((FAIL+1)); ERRORS="${ERRORS}\n  $1: $2"; }
 vlog() { [[ $VERBOSE -eq 1 ]] && echo "        $*" || true; }
 
 wait_for_socket() {
-    for i in $(seq 1 30); do
+    for i in $(seq 1 $(( 30 * TORTURE_WAIT ))); do
         ls /tmp/fluxa-*.sock 2>/dev/null | head -1 | grep -q . && return 0
         sleep 0.1
     done
@@ -90,17 +93,17 @@ while i >= 0 {
 FLX
 
 kill -9 $(pgrep -f "fluxa run" 2>/dev/null) 2>/dev/null || true
-rm -f /tmp/fluxa-*.sock /tmp/fluxa-*.lock 2>/dev/null || true; sleep 0.15
+rm -f /tmp/fluxa-*.sock /tmp/fluxa-*.lock 2>/dev/null || true; sleep $(echo "0.15 * $TORTURE_WAIT" | bc)
 
 "$FLUXA" run "$WORK_DIR/loop_bc.flx" -dev >"$WORK_DIR/c1_out.log" 2>"$WORK_DIR/c1_err.log" &
 
 if ! wait_for_socket; then
     fail "caso1/socket" "IPC socket não apareceu em 3s"
 else
-    sleep 0.3
+    sleep $(echo "0.3 * $TORTURE_WAIT" | bc)
     set_out=$("$FLUXA" set x 99 2>&1 || true)
     vlog "set: $set_out"
-    sleep 0.15
+    sleep $(echo "0.15 * $TORTURE_WAIT" | bc)
     new_val=$(observe_once x || echo "not_found")
     vlog "observe: $new_val"
 
@@ -113,7 +116,7 @@ else
 fi
 
 kill -9 $(pgrep -f "fluxa run" 2>/dev/null) 2>/dev/null || true
-rm -f /tmp/fluxa-*.sock /tmp/fluxa-*.lock 2>/dev/null || true; sleep 0.15
+rm -f /tmp/fluxa-*.sock /tmp/fluxa-*.lock 2>/dev/null || true; sleep $(echo "0.15 * $TORTURE_WAIT" | bc)
 
 # =============================================================================
 # CASO 2 — loop interpretado com print: output muda após set
@@ -134,13 +137,13 @@ FLX
 if ! wait_for_socket; then
     fail "caso2/socket" "IPC socket não apareceu em 3s"
 else
-    sleep 0.3
+    sleep $(echo "0.3 * $TORTURE_WAIT" | bc)
     c5=$(grep -c "^5$" "$WORK_DIR/c2_out.log" 2>/dev/null || echo 0)
     vlog "prints de 5 antes: $c5"
 
     set_out=$("$FLUXA" set number 99 2>&1 || true)
     vlog "set: $set_out"
-    sleep 0.3
+    sleep $(echo "0.3 * $TORTURE_WAIT" | bc)
 
     c99=$(grep -c "^99$" "$WORK_DIR/c2_out.log" 2>/dev/null || echo 0)
     obs=$(observe_once number || echo "not_found")
@@ -155,7 +158,7 @@ else
 fi
 
 kill -9 $(pgrep -f "fluxa run" 2>/dev/null) 2>/dev/null || true
-rm -f /tmp/fluxa-*.sock /tmp/fluxa-*.lock 2>/dev/null || true; sleep 0.15
+rm -f /tmp/fluxa-*.sock /tmp/fluxa-*.lock 2>/dev/null || true; sleep $(echo "0.15 * $TORTURE_WAIT" | bc)
 
 # =============================================================================
 # CASO 3 — status durante loop infinito
@@ -176,7 +179,7 @@ FLX
 if ! wait_for_socket; then
     fail "caso3/socket" "IPC socket não apareceu em 3s"
 else
-    sleep 0.3
+    sleep $(echo "0.3 * $TORTURE_WAIT" | bc)
     status_out=$("$FLUXA" status 2>&1 || true)
     vlog "status: $status_out"
     if echo "$status_out" | grep -q "pid\|cycle\|prst"; then

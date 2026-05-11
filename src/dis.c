@@ -679,15 +679,9 @@ static void sec_warm(ASTNode *prog, Stats *st, int prst_n) {
         int slots =params+locals;
 
         const char *forecast, *reason="";
-        if (fi > WARM_FUNC_CAP_DEFAULT) {
-            forecast="COLD-FALLBACK";
-            reason=" (> warm_func_cap default=32; warm_local direct read — increase via [runtime] warm_func_cap)";
-        } else if (slots > WARM_SLOTS_MAX) {
+        if (slots > WARM_SLOTS_MAX) {
             forecast="COLD-LOCKED";
             reason=" (> 256 slots: wrap may cause QJL collisions)";
-        } else if (a.has_dyn) {
-            forecast="COLD-LOCKED";
-            reason=" (dyn local: type not stable)";
         } else if (a.has_prst_read) {
             forecast="COLD-LOCKED";
             reason=" (reads prst: must pass through prst_pool_has)";
@@ -792,19 +786,17 @@ static void sec_paths(ASTNode *prog, int prst_n, Stats *st) {
 
         int params=n->as.func_decl.param_count;
         int slots =params+count_locals(n->as.func_decl.body);
-        int warm_ok=(fi<=WARM_FUNC_CAP_DEFAULT&&!a.has_dyn&&!a.has_prst_read&&
-                     slots<=WARM_SLOTS_MAX);
+        int warm_ok=(!a.has_prst_read && slots<=WARM_SLOTS_MAX);
         int vm_ok=body_has_while(n->as.func_decl.body);
         if (vm_ok) st->has_vm=1;
 
         dis("  fn %s\n", n->as.func_decl.name);
-        dis("    tier 0 (cold):   calls 1-%d    %dB/read  (%d prst vars)\n",
-            WARM_OBS_LIMIT, 18+20*prst_n, prst_n);
+        dis("    tier 0 (cold):   call 1       %dB/read  (%d prst vars)\n",
+            18+20*prst_n, prst_n);
         if (warm_ok)
-            dis("    tier 1 (warm):   calls %d+      9B/read   after promotion\n",
-                WARM_OBS_LIMIT+1);
+            dis("    tier 1 (warm):   call 2+      9B/read   promoted (2 stable runs)\n");
         else
-            dis("    tier 1 (warm):   cold-locked  18B/read  (warm_local direct)\n");
+            dis("    tier 1 (warm):   n/a          18B/read  (prst read — warm_local direct)\n");
         dis("    tier 2 (hot VM): %s\n",
             vm_ok
             ? "eligible     (while compiled to 3-address bytecode)"
@@ -828,22 +820,18 @@ static void sec_stats(Stats *st, int lines) {
     dis("  AST nodes:       %d\n", st->total_nodes);
     dis("  functions:       %d", st->fn_count);
     if (st->fn_count>0) {
-        int ov=st->fn_count>WARM_FUNC_CAP_DEFAULT ? st->fn_count-WARM_FUNC_CAP_DEFAULT : 0;
-        int cl=st->fn_count-st->promotable-ov;
+        int cl=st->fn_count-st->promotable;
         dis("   (%d promotable", st->promotable);
-        if (cl>0) dis(", %d cold-locked", cl);
-        if (ov>0) dis(", %d beyond cap -> fallback", ov);
+        if (cl>0) dis(", %d prst-reads (warm_local direct)", cl);
         dis(")");
     }
     dis("\n");
     dis("  Blocks:          %d\n", st->block_count);
     dis("  prst vars:       %d\n", st->prst_count);
-    int wfns=st->fn_count<WARM_FUNC_CAP_DEFAULT?st->fn_count:WARM_FUNC_CAP_DEFAULT;
     dis("  warm candidates: %d / %d\n", st->promotable, st->fn_count);
-    dis("  WarmProfile:     %d fn x %dB = %dB  (max %dB)\n",
-        wfns, (int)sizeof(WarmFunc),
-        wfns*(int)sizeof(WarmFunc),
-        WARM_FUNC_CAP_DEFAULT*(int)sizeof(WarmFunc));
+    dis("  WarmProfile:     %d fn x %dB = %dB  (dynamic heap, no cap)\n",
+        st->fn_count, (int)sizeof(WarmFunc),
+        st->fn_count*(int)sizeof(WarmFunc));
     dis("  bytecode VM:     %s\n", st->has_vm  ? "yes" : "no");
     dis("  TCO:             %s\n\n", st->has_tco ? "yes" : "no");
 }

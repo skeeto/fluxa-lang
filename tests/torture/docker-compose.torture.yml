@@ -1,0 +1,27 @@
+# docker-compose.torture.yml — CPU starvation + memory pressure test
+#
+# Simulates an IoT device sharing CPU with other processes:
+#   cpus: 0.05    → 5% of one CPU core (IoT-level starvation)
+#   mem_limit: 128m → 128MB RAM limit for the container
+#   memswap_limit  → no swap (embedded devices have no swap)
+#
+# This catches race conditions, timing bugs, and resource leaks
+# that only manifest under sustained resource pressure.
+#
+# Usage:
+#   make test-torture
+#   docker compose -f tests/torture/docker-compose.torture.yml run --rm fluxa-torture
+#
+# Requirements: docker compose v2, Docker Engine >= 20.10
+
+services:
+  fluxa-torture:
+    build:
+      context: ../..
+      dockerfile: tests/torture/Dockerfile.torture
+    cpus: "0.1"
+    mem_limit: "128m"
+    memswap_limit: "128m"    # no swap — like embedded hardware
+    environment:
+      - FLUXA_TORTURE=1
+    # CMD defined in Dockerfile.torture → /fluxa/run_torture.sh

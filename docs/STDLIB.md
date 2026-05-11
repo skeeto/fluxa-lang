@@ -1,5 +1,5 @@
 # Fluxa Standard Library
-**v0.10 | Sprint 10.c**
+**v0.14**
 
 Reference documentation for all stdlib libs implemented: `std.math`, `std.csv`, `std.json`, `std.strings`, `std.time`, `std.flxthread`.
 

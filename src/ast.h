@@ -67,6 +67,9 @@ struct ASTNode {
     uint8_t  warm_local;       /* warm path: 1 = confirmed function-local,
                                 * never prst — skip prst_pool_has in rt_get.
                                 * Set by resolver. 0 = unknown (safe default). */
+    void    *fn_chunk;         /* Chunk* — compiled bytecode body for NODE_FUNC_DECL.
+                                * NULL = not yet compiled. Compiled on first call
+                                * after warm promotion. Never freed (fn_node stable). */
 
     union {
         /* NODE_PROGRAM / NODE_FUNC_CALL / NODE_BLOCK_STMT */

@@ -12,6 +12,7 @@
 #include "builtins.h"
 #include "block.h"
 #include "fluxa_ffi.h"
+#include "fluxa_alloc.h"
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
@@ -188,7 +189,7 @@ static inline Value rt_get(Runtime *rt, ASTNode *node, const char *name) {
          * Inside rt_get it is just a pointer load — zero hash cost.
          * Only active when the function has been promoted (stable_runs >= 2). */
         WarmFunc *wf = rt->current_wf;
-        if (wf && rt->current_instance == NULL) {
+        if (wf) {
             if (warm_func_is_promoted(wf) && off < WARM_SLOTS_MAX &&
                 off < rt->stack_size) {
                 WarmSlot *ws = &wf->slots[off];
@@ -313,6 +314,15 @@ static inline void rt_set(Runtime *rt, ASTNode *node,
 
 /* ── Forward declaration ─────────────────────────────────────────────────── */
 static Value eval(Runtime *rt, ASTNode *node);
+/* v0.14: callback bridging OP_CALL_METHOD / OP_CALL_FUNC — Value* owner for cache */
+static Value vm_call_callback(void *rt_opaque, Value *owner_kv,
+                               const char *method_or_func,
+                               Value *args, int argc);
+/* v0.14: field access callbacks — Value* owner_kv for inline cache */
+static Value vm_get_field_callback(void *rt_opaque, Value *owner_kv, const char *field);
+static void  vm_set_field_callback(void *rt_opaque, Value *owner_kv, const char *field, Value val);
+/* v0.14: tick callback — called at every OP_JUMP back-edge. */
+static void vm_tick_callback(void *rt_opaque);
 
 /* ── Arithmetic & logical operators ─────────────────────────────────────── */
 static Value eval_binary(Runtime *rt, ASTNode *node) {
@@ -550,8 +560,7 @@ static Value call_function(Runtime *rt, ASTNode *fn_node,
         /* Update WHT path signature after body completes — warm profile
          * uses this to detect stable execution paths (stable_runs counter).
          * current_wf is already set for this function — no hash lookup. */
-        if (rt->warm.enabled && rt->current_wf != NULL &&
-            rt->current_instance == NULL) {
+        if (rt->warm.enabled && rt->current_wf != NULL) {
             warm_update_sig(rt->current_wf);
         }
 
@@ -637,9 +646,10 @@ static Value call_function(Runtime *rt, ASTNode *fn_node,
     rt->current_wf       = (rt->warm.enabled && caller_fn)
                            ? warm_profile_get_func(&rt->warm, (uintptr_t)caller_fn)
                            : NULL;
-    if (save_slots > 0)
+    if (caller_stack) {
         memcpy(rt->stack, caller_stack, sizeof(Value) * save_slots);
-    free(caller_stack);
+        free(caller_stack);
+    }
     rt->call_depth--;
     return result;
 }
@@ -705,6 +715,503 @@ static BlockInstance *resolve_instance(Runtime *rt, const char *owner_name) {
     if (scope_get(&rt->scope, owner_name, &v) && v.type == VAL_BLOCK_INST)
         return v.as.block_inst;
     return NULL;
+}
+
+/* ── v0.14: vm_tick_callback — called at OP_JUMP back-edge ──────────────── */
+/* Runs GC sweep and (in thread clones) processes the mailbox.
+ * The lib (flxthread) knows nothing about this — it registers a mailbox
+ * and the thread runtime calls its own processing naturally here.           */
+static void vm_tick_callback(void *rt_opaque) {
+    Runtime *rt = (Runtime *)rt_opaque;
+    if (!rt) return;
+    /* GC sweep — only if there's something to collect */
+    if (rt->gc.count > 0)
+        gc_sweep(&rt->gc, gc_dyn_free_fn);
+    /* Mailbox — only in thread clones (current_thread is NULL in main runtime) */
+#ifdef FLUXA_STD_FLXTHREAD
+    if (rt->current_thread)
+        flx_mailbox_drain((FlxThread*)rt->current_thread, rt, rt->current_instance);
+#endif
+}
+
+/* ── v0.14 Fase 3: method_try_inline ────────────────────────────────────── */
+/* Attempt to execute a Block method inline — zero frame save/restore.
+ *
+ * Inlinable: methods whose body consists ONLY of:
+ *   - NODE_MEMBER_ASSIGN where value is a simple expression (binary/literal/ident/member_access)
+ *   - NODE_RETURN with a simple expression
+ *   - NODE_ASSIGN / NODE_VAR_DECL with simple value
+ *
+ * "Simple expression": no FUNC_CALL, no MEMBER_CALL, no indexed access, no danger.
+ * Params are accessed from args[], fields via scope_get/set on inst->scope directly.
+ *
+ * Returns 1 + writes *result if inline succeeded.
+ * Returns 0 if method is not inlinable — caller falls back to full call_function path.
+ *
+ * Constraints:
+ *   - No scope_new / scope_free — we never build a new scope.
+ *   - Params live in a local array indexed by their resolved_offset (0..param_count-1).
+ *   - Only MEMBER_ASSIGN and RETURN are acted upon; others cause fallback.
+ *   - safe for Block fields: scope_get/set on inst->scope.
+ *   - Not recursive — if body calls another fn, fallback.
+ */
+
+static int expr_is_inlinable(const ASTNode *e, int param_count) {
+    if (!e) return 0;
+    switch (e->type) {
+        case NODE_INT_LIT:
+        case NODE_FLOAT_LIT:
+        case NODE_BOOL_LIT:
+        case NODE_STRING_LIT:
+            return 1;
+        case NODE_IDENTIFIER:
+            /* Only inline if it's a confirmed param slot.
+             * Block fields have resolved_offset that may alias param slots —
+             * reject any identifier that isn't in 0..param_count-1. */
+            return (e->resolved_offset >= 0 &&
+                    e->resolved_offset < param_count &&
+                    e->warm_local);
+        case NODE_MEMBER_ACCESS:
+            return 1;  /* inst.field — direct scope read, safe */
+        case NODE_BINARY_EXPR:
+            return expr_is_inlinable(e->as.binary.left,  param_count) &&
+                   expr_is_inlinable(e->as.binary.right, param_count);
+        default:
+            return 0;
+    }
+}
+
+static int stmt_is_inlinable(const ASTNode *s, int param_count) {
+    if (!s) return 0;
+    switch (s->type) {
+        case NODE_MEMBER_ASSIGN:
+            return expr_is_inlinable(s->as.member_assign.value, param_count);
+        case NODE_RETURN:
+            return !s->as.ret.value || expr_is_inlinable(s->as.ret.value, param_count);
+        case NODE_ASSIGN:
+        case NODE_VAR_DECL: {
+            const ASTNode *val = (s->type == NODE_VAR_DECL)
+                               ? s->as.var_decl.initializer
+                               : s->as.assign.value;
+            return s->resolved_offset >= 0 && expr_is_inlinable(val, param_count);
+        }
+        default:
+            return 0;
+    }
+}
+
+/* Evaluate a simple expression inline — no eval() call, no scope lookup overhead.
+ * params: args array indexed by resolved_offset (param 0 = args[0], etc.)
+ * inst:   Block instance for MEMBER_ACCESS field reads                       */
+static Value eval_simple_expr(const ASTNode *e, const Value *params, int param_count,
+                               BlockInstance *inst, Runtime *rt) {
+    if (!e) return val_nil();
+    switch (e->type) {
+        case NODE_INT_LIT:    return val_int(e->as.integer.value);
+        case NODE_FLOAT_LIT:  return val_float(e->as.real.value);
+        case NODE_BOOL_LIT:   return val_bool(e->as.boolean.value);
+        case NODE_STRING_LIT: return val_string(e->as.str.value);
+        case NODE_IDENTIFIER: {
+            int off = e->resolved_offset;
+            /* Only params are safe — fields are rejected by expr_is_inlinable */
+            if (off >= 0 && off < param_count) return params[off];
+            return val_nil();
+        }
+        case NODE_MEMBER_ACCESS: {
+            Value v; v.type = VAL_NIL;
+            BlockInstance *fi = resolve_instance(rt, e->as.member_access.owner);
+            if (fi) scope_get(&fi->scope, e->as.member_access.field, &v);
+            return v;
+        }
+        case NODE_BINARY_EXPR: {
+            Value l = eval_simple_expr(e->as.binary.left,  params, param_count, inst, rt);
+            Value r = eval_simple_expr(e->as.binary.right, params, param_count, inst, rt);
+            const char *op = e->as.binary.op;
+            if (l.type == VAL_INT && r.type == VAL_INT) {
+                long lv = l.as.integer, rv = r.as.integer;
+                if      (!strcmp(op,"+"))  return val_int(lv + rv);
+                else if (!strcmp(op,"-"))  return val_int(lv - rv);
+                else if (!strcmp(op,"*"))  return val_int(lv * rv);
+                else if (!strcmp(op,"/"))  return rv ? val_int(lv / rv) : val_int(0);
+                else if (!strcmp(op,"%"))  return rv ? val_int(lv % rv) : val_int(0);
+                else if (!strcmp(op,"==")) return val_bool(lv == rv);
+                else if (!strcmp(op,"!=")) return val_bool(lv != rv);
+                else if (!strcmp(op,"<"))  return val_bool(lv <  rv);
+                else if (!strcmp(op,">"))  return val_bool(lv >  rv);
+                else if (!strcmp(op,"<=")) return val_bool(lv <= rv);
+                else if (!strcmp(op,">=")) return val_bool(lv >= rv);
+            }
+            if (l.type == VAL_FLOAT || r.type == VAL_FLOAT) {
+                double lv = (l.type==VAL_INT) ? (double)l.as.integer : l.as.real;
+                double rv = (r.type==VAL_INT) ? (double)r.as.integer : r.as.real;
+                if      (!strcmp(op,"+"))  return val_float(lv + rv);
+                else if (!strcmp(op,"-"))  return val_float(lv - rv);
+                else if (!strcmp(op,"*"))  return val_float(lv * rv);
+                else if (!strcmp(op,"/"))  return rv ? val_float(lv/rv) : val_float(0);
+                else if (!strcmp(op,"==")) return val_bool(lv == rv);
+                else if (!strcmp(op,"<"))  return val_bool(lv <  rv);
+                else if (!strcmp(op,">"))  return val_bool(lv >  rv);
+            }
+            return val_nil();
+        }
+        default:
+            return val_nil();
+    }
+}
+
+static int method_try_inline(Runtime *rt, ASTNode *fn_node,
+                              BlockInstance *inst,
+                              const Value *args, int argc,
+                              Value *result) {
+    (void)inst; (void)argc;
+    ASTNode *body = fn_node->as.func_decl.body;
+    int param_count = fn_node->as.func_decl.param_count;
+
+    /* Verify all statements are inlinable */
+    for (int i = 0; i < body->as.list.count; i++) {
+        if (!stmt_is_inlinable(body->as.list.children[i], param_count))
+            return 0;
+    }
+
+    /* All inlinable — execute without frame save/restore */
+    *result = val_nil();
+    for (int i = 0; i < body->as.list.count; i++) {
+        ASTNode *s = body->as.list.children[i];
+        switch (s->type) {
+            case NODE_MEMBER_ASSIGN: {
+                BlockInstance *fi = resolve_instance(rt, s->as.member_assign.owner);
+                if (!fi) { return 0; }
+                Value v = eval_simple_expr(s->as.member_assign.value,
+                                           args, param_count, inst, rt);
+                scope_set(&fi->scope, s->as.member_assign.field, v);
+                break;
+            }
+            case NODE_ASSIGN:
+            case NODE_VAR_DECL: {
+                /* Local assignment — we have no stack here; only allowed if
+                 * the local is a param slot (resolved_offset < param_count).
+                 * This handles patterns like: int tmp = a + b  followed by use. */
+                /* For safety: fall back if local assignment */
+                return 0;
+            }
+            case NODE_RETURN: {
+                if (s->as.ret.value)
+                    *result = eval_simple_expr(s->as.ret.value,
+                                               args, param_count, inst, rt);
+                return 1;
+            }
+            default:
+                return 0;
+        }
+        if (rt->had_error) return 0;
+    }
+    return 1;
+}
+
+/* ── v0.14: vm_get_field_callback / vm_set_field_callback ───────────────── */
+/* OP_GET_FIELD: read a Block instance field into a VM register.
+ * Mirrors eval NODE_MEMBER_ACCESS — resolve_instance + scope_get.         */
+/* Resolve instance from a mutable constant Value.
+ * Cold path (VAL_STRING): call resolve_instance, then patch kv to VAL_PTR.
+ * Hot path  (VAL_PTR):    deref directly — zero hash lookup.              */
+static inline BlockInstance *resolve_inst_cached(Runtime *rt, Value *owner_kv) {
+    if (__builtin_expect(owner_kv->type == VAL_PTR, 1)) {
+        /* Hot path: already cached */
+        return (BlockInstance *)owner_kv->as.ptr;
+    }
+    /* Cold path: resolve by name and cache */
+    BlockInstance *inst = resolve_instance(rt, owner_kv->as.string);
+    if (inst) {
+        owner_kv->type   = VAL_PTR;
+        owner_kv->as.ptr = inst;
+    }
+    return inst;
+}
+
+static Value vm_get_field_callback(void *rt_opaque, Value *owner_kv, const char *field) {
+    Runtime *rt = (Runtime *)rt_opaque;
+    if (!rt) return val_nil();
+    BlockInstance *inst = resolve_inst_cached(rt, owner_kv);
+    if (!inst) {
+        char buf[280];
+        snprintf(buf, sizeof(buf), "undefined Block instance (OP_GET_FIELD)");
+        rt_error(rt, buf); return val_nil();
+    }
+    Value v; v.type = VAL_NIL;
+    scope_get(&inst->scope, field, &v);
+    return v;
+}
+
+static void vm_set_field_callback(void *rt_opaque, Value *owner_kv, const char *field, Value val) {
+    Runtime *rt = (Runtime *)rt_opaque;
+    if (!rt) return;
+    BlockInstance *inst = resolve_inst_cached(rt, owner_kv);
+    if (!inst) return;
+    scope_set(&inst->scope, field, val);
+}
+
+/* ── v0.14: vm_call_callback — bridges OP_CALL_METHOD / OP_CALL_FUNC ────── */
+/* Called from vm_run when the bytecode VM encounters a call opcode.
+ * owner: NULL → plain function call; non-NULL → Block method call.
+ * args: pointer into R[] of the VM — valid only during this call.
+ *
+ * For Block method calls:
+ *   1. Check stdlib registry (same logic as NODE_MEMBER_CALL in eval)
+ *   2. resolve_instance(owner) → inst
+ *   3. scope_get(inst->scope, method) → fn_val
+ *   4. call_function(fn_val, pre-evaluated args[], inst)
+ *
+ * For plain function calls:
+ *   1. Lookup fn in rt->scope or global_table
+ *   2. call_function with no instance
+ *
+ * Ownership: args[] are read-only values from R[]. We copy them into a
+ * local Value array for call_function (which takes ASTNode** args normally).
+ * We use a pre-evaluated variant path to avoid re-evaluating. */
+static Value vm_call_callback(void *rt_opaque, Value *owner_kv,
+                               const char *method_or_func,
+                               Value *args, int argc) {
+    Runtime *rt = (Runtime *)rt_opaque;
+    if (!rt) return val_nil();
+
+    if (owner_kv) {
+        /* ── Block method call or stdlib/FFI ──────────────────────────── */
+        /* For stdlib: always resolve by name (VAL_STRING) since stdlib
+         * owners are not BlockInstances and must not be cached as VAL_PTR */
+        const char *owner_str = (owner_kv->type == VAL_STRING)
+                                ? owner_kv->as.string : NULL;
+
+        /* 1. Stdlib dispatch — only when we have a string owner name */
+        if (owner_str) for (int _ri = 0; _ri < FLUXA_LIB_COUNT; _ri++) {
+            const FluxaLibEntry *_e = &fluxa_lib_registry[_ri];
+            if (!_e->enabled) continue;
+            if (!fluxa_std_lib_enabled(&rt->config.std_libs, _e->name)) continue;
+            if (strcmp(owner_str, _e->owner) != 0) continue;
+            if (_e->cfg_aware && _e->call_cfg)
+                return _e->call_cfg(method_or_func, args, argc,
+                                    &rt->err_stack, &rt->had_error,
+                                    rt->current_line, &rt->config);
+            if (_e->rt_aware && _e->call_rt)
+                return _e->call_rt(method_or_func, args, argc,
+                                   &rt->err_stack, &rt->had_error,
+                                   rt->current_line, rt);
+            if (_e->call)
+                return _e->call(method_or_func, args, argc,
+                                &rt->err_stack, &rt->had_error,
+                                rt->current_line);
+        }
+
+        /* 2. Block instance method — use inline cache via resolve_inst_cached */
+        BlockInstance *inst = resolve_inst_cached(rt, owner_kv);
+        if (!inst) {
+            const char *oname = (owner_kv->type==VAL_STRING) ? owner_kv->as.string : "(cached)";
+            char buf[280];
+            snprintf(buf, sizeof(buf), "undefined Block instance: %s", oname);
+            rt_error(rt, buf); return val_nil();
+        }
+        Value fn_val; fn_val.type = VAL_NIL;
+        if (!scope_get(&inst->scope, method_or_func, &fn_val) ||
+            fn_val.type != VAL_FUNC) {
+            char buf[280];
+            snprintf(buf, sizeof(buf), "block has no method '%s'",
+                     method_or_func);
+            rt_error(rt, buf); return val_nil();
+        }
+        ASTNode *fn_node = fn_val.as.func;
+        int param_count  = fn_node->as.func_decl.param_count;
+        if (argc != param_count) {
+            char buf[280];
+            snprintf(buf, sizeof(buf),
+                "Block method '%s' expects %d arg(s), got %d",
+                method_or_func, param_count, argc);
+            rt_error(rt, buf); return val_nil();
+        }
+        /* ── Fase 3: try inline execution first (zero frame overhead) ─── */
+        {
+            Value inline_result;
+            if (method_try_inline(rt, fn_node, inst, args, argc, &inline_result))
+                return inline_result;
+        }
+        /* ── Fallback: full frame save/restore ──────────────────────── */
+        /* Save caller frame */
+        Scope          caller_scope = rt->scope;
+        int            caller_sz    = rt->stack_size;
+        BlockInstance *caller_inst  = rt->current_instance;
+        ASTNode       *caller_fn    = rt->current_fn;
+        /* Save VM register range. caller_sz = chunk.next_reg (set before vm_run).
+         * Stack-allocated: each C call frame is independent — no overflow risk
+         * since vm_call_callback is not called recursively (VM back-edge → callback
+         * → eval → while → vm_run → back-edge — but this inner vm_run has its
+         * own callback invocation with its own C frame). */
+        int   save_slots   = (caller_sz < FLUXA_STACK_SIZE) ? caller_sz : FLUXA_STACK_SIZE;
+        /* Fixed-size array: predictable stack usage, no VLA overhead */
+        Value caller_stack[FLUXA_STACK_SIZE];
+        if (save_slots > 0)
+            memcpy(caller_stack, rt->stack, sizeof(Value) * save_slots);
+        rt->scope            = scope_new();
+        rt->stack_size       = 0;
+        rt->current_instance = inst;
+        rt->current_fn       = fn_node;
+        rt->current_wf       = rt->warm.enabled
+                               ? warm_profile_get_func(&rt->warm,
+                                                       (uintptr_t)fn_node)
+                               : NULL;
+        rt->call_depth++;
+        /* args = &R[first_arg] inside rt->stack — copy before zeroing */
+        Value arg_copy[64];
+        int safe_argc = argc < 64 ? argc : 64;
+        for (int i = 0; i < safe_argc; i++) arg_copy[i] = args[i];
+        int zero_slots = argc + 64;
+        if (zero_slots < caller_sz + 1) zero_slots = caller_sz + 1;
+        if (zero_slots > FLUXA_STACK_SIZE) zero_slots = FLUXA_STACK_SIZE;
+        for (int i = 0; i < zero_slots; i++) rt->stack[i].type = VAL_NIL;
+        for (int i = 0; i < safe_argc; i++) {
+            rt->stack[i] = arg_copy[i];
+            if (rt->stack_size <= i) rt->stack_size = i + 1;
+        }
+        /* Register self for recursion */
+        Value self; self.type = VAL_FUNC; self.as.func = fn_node;
+        scope_set(&rt->scope, fn_node->as.func_decl.name, self);
+        rt->ret.active = rt->ret.tco_active = 0;
+        rt->ret.value  = val_nil();
+        /* Execute body */
+        ASTNode *body = fn_node->as.func_decl.body;
+        for (int i = 0; i < body->as.list.count; i++) {
+            eval(rt, body->as.list.children[i]);
+            if (rt->had_error || rt->ret.active || rt->ret.tco_active) break;
+        }
+        if (rt->warm.enabled && rt->current_wf)
+            warm_update_sig(rt->current_wf);
+        Value result = rt->ret.active ? rt->ret.value : val_nil();
+        rt->ret.active = 0;
+        /* Restore caller frame */
+        scope_free(&rt->scope);
+        rt->scope            = caller_scope;
+        rt->stack_size       = caller_sz;
+        rt->current_instance = caller_inst;
+        rt->current_fn       = caller_fn;
+        rt->current_wf       = (rt->warm.enabled && caller_fn)
+                               ? warm_profile_get_func(&rt->warm,
+                                                       (uintptr_t)caller_fn)
+                               : NULL;
+        if (save_slots > 0)
+            memcpy(rt->stack, caller_stack, sizeof(Value) * save_slots);
+        rt->call_depth--;
+        return result;
+    }
+
+    /* ── Plain function call ────────────────────────────────────────────── */
+    /* Builtins first */
+    if (builtin_is(method_or_func))
+        return builtin_dispatch_values(rt, method_or_func, args, argc);
+
+    Value fn_val; fn_val.type = VAL_NIL;
+    /* 1. Current scope (local fns registered in this frame) */
+    if (!scope_get(&rt->scope, method_or_func, &fn_val) || fn_val.type != VAL_FUNC) {
+        /* 2. Instance scope — handles intra-Block calls like iterate() from run() */
+        if (rt->current_instance)
+            scope_get(&rt->current_instance->scope, method_or_func, &fn_val);
+    }
+    /* 3. Global table — top-level functions */
+    if (fn_val.type != VAL_FUNC)
+        scope_table_get(rt->global_table, method_or_func, &fn_val);
+    if (fn_val.type != VAL_FUNC) {
+        char buf[280];
+        snprintf(buf, sizeof(buf), "undefined function '%s' (OP_CALL_FUNC)",
+                 method_or_func);
+        rt_error(rt, buf); return val_nil();
+    }
+    ASTNode *fn_node    = fn_val.as.func;
+    int      param_count = fn_node->as.func_decl.param_count;
+    if (argc != param_count) {
+        char buf[280];
+        snprintf(buf, sizeof(buf), "function '%s' expects %d arg(s), got %d",
+                 method_or_func, param_count, argc);
+        rt_error(rt, buf); return val_nil();
+    }
+
+    /* ── Fase 2 fast path: use compiled fn chunk if available ─────────── */
+    /* Only compile pure functions (not Block methods — they access inst->scope
+     * via field names which can't be resolved to stack offsets in fn body). */
+    if (!fn_node->fn_chunk) {
+        Chunk *ch = (Chunk *)malloc(sizeof(Chunk));
+        if (ch && chunk_compile_fn(ch, fn_node)) {
+            fn_node->fn_chunk = ch;  /* cache on AST node — never freed */
+        } else {
+            free(ch);
+            fn_node->fn_chunk = (void *)(uintptr_t)1;  /* sentinel: failed, don't retry */
+        }
+    }
+    if (fn_node->fn_chunk && fn_node->fn_chunk != (void *)(uintptr_t)1) {
+        Chunk *ch = (Chunk *)fn_node->fn_chunk;
+        /* fn_regs must cover all registers the chunk uses: 0..chunk.next_reg-1.
+         * Add 32 slots safety margin in case of edge cases in next_reg tracking. */
+        int reg_count = (int)ch->next_reg + 32;
+        if (reg_count < param_count + 32) reg_count = param_count + 32;
+        Value *fn_regs = (Value *)calloc((size_t)reg_count, sizeof(Value));
+        if (!fn_regs) goto fn_fallback;
+        for (int _i = 0; _i < param_count; _i++) fn_regs[_i] = args[_i];
+        Value result = vm_run_fn(ch, fn_regs, reg_count,
+                                 vm_call_callback, vm_get_field_callback,
+                                 vm_set_field_callback, rt);
+        free(fn_regs);
+        return result;
+    }
+    fn_fallback: ;
+    Scope          caller_scope = rt->scope;
+    int            caller_sz    = rt->stack_size;
+    BlockInstance *caller_inst  = rt->current_instance;
+    ASTNode       *caller_fn    = rt->current_fn;
+    int   save_slots   = (caller_sz < FLUXA_STACK_SIZE) ? caller_sz : FLUXA_STACK_SIZE;
+    Value caller_stack[FLUXA_STACK_SIZE];
+    if (save_slots > 0)
+        memcpy(caller_stack, rt->stack, sizeof(Value) * save_slots);
+    rt->scope            = scope_new();
+    rt->stack_size       = 0;
+    /* Preserve current_instance for intra-Block calls (e.g. iterate() from run()) */
+    rt->current_instance = caller_inst;
+    rt->current_fn       = fn_node;
+    rt->current_wf       = rt->warm.enabled
+                           ? warm_profile_get_func(&rt->warm, (uintptr_t)fn_node)
+                           : NULL;
+    rt->call_depth++;
+    /* args = &R[first_arg] inside rt->stack — copy before zeroing */
+    Value parg_copy[64];
+    int safe_argc2 = argc < 64 ? argc : 64;
+    for (int i = 0; i < safe_argc2; i++) parg_copy[i] = args[i];
+    int zero_slots = argc + 64;
+    if (zero_slots < caller_sz + 1) zero_slots = caller_sz + 1;
+    if (zero_slots > FLUXA_STACK_SIZE) zero_slots = FLUXA_STACK_SIZE;
+    for (int i = 0; i < zero_slots; i++) rt->stack[i].type = VAL_NIL;
+    for (int i = 0; i < safe_argc2; i++) {
+        rt->stack[i] = parg_copy[i];
+        if (rt->stack_size <= i) rt->stack_size = i + 1;
+    }
+    Value self; self.type = VAL_FUNC; self.as.func = fn_node;
+    scope_set(&rt->scope, fn_node->as.func_decl.name, self);
+    rt->ret.active = rt->ret.tco_active = 0;
+    rt->ret.value  = val_nil();
+    ASTNode *body = fn_node->as.func_decl.body;
+    for (int i = 0; i < body->as.list.count; i++) {
+        eval(rt, body->as.list.children[i]);
+        if (rt->had_error || rt->ret.active || rt->ret.tco_active) break;
+    }
+    if (rt->warm.enabled && rt->current_wf)
+        warm_update_sig(rt->current_wf);
+    Value result = rt->ret.active ? rt->ret.value : val_nil();
+    rt->ret.active = 0;
+    scope_free(&rt->scope);
+    rt->scope            = caller_scope;
+    rt->stack_size       = caller_sz;
+    rt->current_instance = caller_inst;
+    rt->current_fn       = caller_fn;
+    rt->current_wf       = (rt->warm.enabled && caller_fn)
+                           ? warm_profile_get_func(&rt->warm, (uintptr_t)caller_fn)
+                           : NULL;
+    if (save_slots > 0)
+        memcpy(rt->stack, caller_stack, sizeof(Value) * save_slots);
+    rt->call_depth--;
+    return result;
 }
 
 /* ── Runtime-aware scope cleanup ─────────────────────────────────────────── */
@@ -1084,8 +1591,18 @@ static Value eval(Runtime *rt, ASTNode *node) {
                         }
                     }
                 }
+                /* Tell nested calls (via vm_call_callback) how many stack
+                 * slots the VM uses — so call_function saves/restores correctly.
+                 * chunk.next_reg is the highest register index + 1 used. */
+                if (rt->stack_size < (int)chunk.next_reg)
+                    rt->stack_size = (int)chunk.next_reg;
+                /* Pass tick_cb only when needed — avoids function call overhead
+                 * at every back-edge for pure loops with no GC/mailbox work. */
+                vm_tick_cb_t tick = (rt->gc.count > 0 || rt->current_thread)
+                                    ? vm_tick_callback : NULL;
                 vm_run(&chunk, &rt->scope, rt->stack, rt->stack_size,
-                       rt->cancel_flag);
+                       rt->cancel_flag, vm_call_callback, rt, tick,
+                       vm_get_field_callback, vm_set_field_callback);
                 chunk_free(&chunk);
                 /* Sprint 7: after VM, sync prst vars from rt->stack back to
                  * pool and global_table. The VM writes rt->stack[offset]
@@ -2456,6 +2973,7 @@ int runtime_exec(ASTNode *program) {
         prst_graph_free(&rt.prst_graph);
     }
     ffi_registry_free(&rt.ffi);
+    warm_profile_free(&rt.warm);
     return rt.had_error ? 1 : 0;
 }
 
@@ -2499,6 +3017,10 @@ int runtime_exec_explain(ASTNode *program) {
     errstack_clear(&rt.err_stack);
     gc_init(&rt.gc, config.gc_cap);
     ffi_registry_init(&rt.ffi);
+    warm_profile_init(&rt.warm, config.warm_func_cap);
+    rt.warm.enabled = 1;
+    rt.current_fn   = NULL;
+    rt.current_wf   = NULL;
     /* Sprint 9.c-2: pre-load [ffi] libs from fluxa.toml */
     ffi_load_from_config(&rt.ffi, &rt.err_stack, &config);
     prst_pool_init(&rt.prst_pool);
@@ -2529,6 +3051,7 @@ int runtime_exec_explain(ASTNode *program) {
     prst_pool_free(&rt.prst_pool);
     prst_graph_free(&rt.prst_graph);
     ffi_registry_free(&rt.ffi);
+    warm_profile_free(&rt.warm);
     return rt.had_error ? 1 : 0;
 }
 
@@ -2649,6 +3172,10 @@ int runtime_apply(ASTNode *program, PrstPool *pool_in) {
     errstack_clear(&rt.err_stack);
     gc_init(&rt.gc, config.gc_cap);
     ffi_registry_init(&rt.ffi);
+    warm_profile_init(&rt.warm, config.warm_func_cap);
+    rt.warm.enabled = 1;
+    rt.current_fn   = NULL;
+    rt.current_wf   = NULL;
     /* Sprint 9.c-2: pre-load [ffi] libs from fluxa.toml */
     ffi_load_from_config(&rt.ffi, &rt.err_stack, &config);
     prst_graph_init_cap(&rt.prst_graph, config.prst_graph_cap);
@@ -2695,6 +3222,7 @@ int runtime_apply(ASTNode *program, PrstPool *pool_in) {
     gc_collect_all(&rt.gc, gc_dyn_free_fn);
     prst_graph_free(&rt.prst_graph);
     ffi_registry_free(&rt.ffi);
+    warm_profile_free(&rt.warm);
     return result;
 }
 

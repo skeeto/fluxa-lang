@@ -1,7 +1,8 @@
-// bench_block.flx — não-regressão de performance (Sprint 5)
+// bench_block.flx — não-regressão de performance (Sprint 5 / v0.14)
 // Dois cenários:
-// 1. Loop sobre variáveis locais dentro de método (sem acesso a campo) — deve usar VM
-// 2. Loop com acesso a campo de instância — usa AST slow path (esperado)
+// 1. Loop sobre variáveis locais dentro de método — usa bytecode VM (rápido)
+// 2. Loop com chamada de método (OP_CALL_METHOD) — call_function por iteração
+//    Para acesso direto a campo sem método, veja bench_field.flx (Fase 2)
 
 Block Somador {
     int total = 0

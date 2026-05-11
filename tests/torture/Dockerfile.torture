@@ -1,0 +1,43 @@
+# Dockerfile.torture — IoT runtime simulation
+#
+# Simulates executing Fluxa on a resource-constrained device (ESP32/RP2040).
+# The binary is compiled on the HOST before this container starts.
+# Inside: only the test suite runs under CPU/RAM constraints.
+#
+# Resource limits set in docker-compose.torture.yml:
+#   cpus: 0.1    → 10% of one core  (IoT-level CPU)
+#   mem: 128m    → 128MB RAM        (ESP32-class)
+#   no swap      → embedded devices have no swap
+
+FROM ubuntu:24.04
+
+# Runtime deps — install everything Fluxa might link against
+# The binary is compiled on the host; we need all its shared lib deps here.
+# This covers the full std libs set (libsodium, libcurl, libmosquitto, sqlite3, etc.)
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    libffi8 libsodium23 libz1 libssl3 \
+    libcurl4 libmosquitto1 libsqlite3-0 \
+    python3 bash bc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /fluxa
+
+# Pre-compiled binary injected by make test-torture
+# (compiled on host with full CPU — only execution is throttled)
+COPY tests/torture/fluxa_torture_bin /fluxa/fluxa
+RUN chmod +x /fluxa/fluxa
+
+# Test suite and supporting files
+COPY tests/           /fluxa/tests/
+COPY Makefile         /fluxa/Makefile
+
+# Make all test scripts executable
+RUN find /fluxa/tests -name "*.sh" -exec chmod +x {} \;
+
+COPY tests/torture/run_torture.sh /fluxa/run_torture.sh
+RUN chmod +x /fluxa/run_torture.sh
+
+ENV FLUXA_TORTURE=1
+
+# run_torture.sh runs the test suites directly — no make build step inside
+CMD ["/fluxa/run_torture.sh"]

@@ -16,5 +16,6 @@ int builtin_is(const char *name);
 typedef Value (*EvalFn)(struct Runtime *rt, ASTNode *node);
 
 Value builtin_dispatch(struct Runtime *rt, ASTNode *call, EvalFn eval_fn);
+Value builtin_dispatch_values(struct Runtime *rt, const char *name, Value *args, int argc);
 
 #endif /* FLUXA_BUILTINS_H */

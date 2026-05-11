@@ -11,6 +11,7 @@ WORK="$(mktemp -d)"
 FLOOD_PIDS=()
 trap 'rm -rf "$WORK"; kill "$RT_PID" 2>/dev/null || true
       for p in "${FLOOD_PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done' EXIT
+RT_PID=0
 FAILS=0
 
 pass() { printf "  PASS  security/%s\n" "$1"; }
@@ -30,7 +31,7 @@ echo "── Scenario 2: FD Exhaustion / Connection Cap (AC 4.1) ─────
 cat > "$WORK/main.flx" << 'FLX'
 prst int counter = 0
 int i = 0
-while i < 2000000000 { counter = counter + 1; i = i + 1 }
+while i < 2000000000 { counter = counter + 1  i = i + 1 }
 FLX
 printf '[project]\nname="t"\nentry="main.flx"\n' > "$WORK/fluxa.toml"
 

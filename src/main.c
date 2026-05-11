@@ -546,10 +546,20 @@ static int run_logs(void) {
 
 /* fluxa status
  * Print a health snapshot of the running runtime. */
-static int run_status(void) {
+static int run_status_pid(int explicit_pid) {
     IpcClient cli;
-    int pid = ipc_connect_auto(&cli);
-    if (pid < 0) return 1;
+    int pid;
+    if (explicit_pid > 0) {
+        /* Connect to specific pid — no auto-discover ambiguity */
+        if (ipc_client_connect(&cli, explicit_pid) < 0) {
+            fprintf(stderr, "[fluxa] cannot connect to runtime (pid %d)\n", explicit_pid);
+            return 1;
+        }
+        pid = explicit_pid;
+    } else {
+        pid = ipc_connect_auto(&cli);
+        if (pid < 0) return 1;
+    }
 
     IpcRequest  req;
     IpcResponse resp;
@@ -1432,7 +1442,11 @@ int main(int argc, char **argv) {
     /* ── Commands with no mandatory file argument ── */
 
     if (strcmp(cmd, "logs")   == 0) return run_logs();
-    if (strcmp(cmd, "status") == 0) return run_status();
+    if (strcmp(cmd, "status") == 0) {
+        /* Optional: fluxa status <pid> — connect to specific runtime */
+        int explicit_pid = (argc >= 3) ? atoi(argv[2]) : 0;
+        return run_status_pid(explicit_pid);
+    }
 
     /* fluxa update <new_binary> [-p]
      * Runtime Update Protocol: replace running binary with zero downtime. */
