@@ -715,14 +715,15 @@ FUZZ_BUILD = $(FUZZ_DIR)/build
 # Each target lists its src deps. Header-only stdlib libs need scope.c
 # because their dispatch can hand back VAL_STRING / VAL_DYN that we free
 # via value_free_data.
-FUZZ_LEXER_SRCS  = src/lexer.c
-FUZZ_PARSER_SRCS = src/lexer.c src/parser.c
-FUZZ_TOML_SRCS   =
-FUZZ_CSV_SRCS    = src/scope.c
-FUZZ_JSON_SRCS   =
-FUZZ_JSON2_SRCS  =
+FUZZ_LEXER_SRCS    = src/lexer.c
+FUZZ_PARSER_SRCS   = src/lexer.c src/parser.c
+FUZZ_TOML_SRCS     =
+FUZZ_CSV_SRCS      = src/scope.c
+FUZZ_JSON_SRCS     =
+FUZZ_JSON2_SRCS    =
+FUZZ_SNAPSHOT_SRCS = src/scope.c
 
-FUZZ_TARGETS = lexer parser toml csv json json2
+FUZZ_TARGETS = lexer parser toml csv json json2 snapshot
 
 .PHONY: fuzz fuzz-build fuzz-clean $(addprefix fuzz-,$(FUZZ_TARGETS))
 
@@ -747,9 +748,13 @@ $(FUZZ_BUILD)/fuzz_json: $(FUZZ_DIR)/fuzz_json.c $(FUZZ_JSON_SRCS) | $(FUZZ_BUIL
 $(FUZZ_BUILD)/fuzz_json2: $(FUZZ_DIR)/fuzz_json2.c $(FUZZ_JSON2_SRCS) | $(FUZZ_BUILD)
 	$(FUZZ_CC) $(FUZZ_FLAGS) $(FUZZ_JSON2_SRCS) $< -o $@
 
-fuzz-build: $(FUZZ_BUILD)/fuzz_lexer  $(FUZZ_BUILD)/fuzz_parser \
-            $(FUZZ_BUILD)/fuzz_toml   $(FUZZ_BUILD)/fuzz_csv    \
-            $(FUZZ_BUILD)/fuzz_json   $(FUZZ_BUILD)/fuzz_json2
+$(FUZZ_BUILD)/fuzz_snapshot: $(FUZZ_DIR)/fuzz_snapshot.c $(FUZZ_SNAPSHOT_SRCS) | $(FUZZ_BUILD)
+	$(FUZZ_CC) $(FUZZ_FLAGS) $(FUZZ_SNAPSHOT_SRCS) $< -o $@
+
+fuzz-build: $(FUZZ_BUILD)/fuzz_lexer  $(FUZZ_BUILD)/fuzz_parser   \
+            $(FUZZ_BUILD)/fuzz_toml   $(FUZZ_BUILD)/fuzz_csv      \
+            $(FUZZ_BUILD)/fuzz_json   $(FUZZ_BUILD)/fuzz_json2    \
+            $(FUZZ_BUILD)/fuzz_snapshot
 	@echo "✓ fuzz build ok → $(FUZZ_BUILD)/fuzz_*"
 
 # Per-target run target. Each fuzzer writes its findings under
