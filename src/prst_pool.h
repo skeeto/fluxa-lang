@@ -33,6 +33,12 @@ typedef struct {
     int        cap;
 } PrstPool;
 
+/* Forward declarations — prst_pool_free / prst_pool_set use them, but the
+ * implementations live further down because they recurse on themselves
+ * via VAL_ARR walks. */
+static inline Value prst_value_deep_clone(const Value *src);
+static inline void  prst_value_free_clone(Value *v);
+
 static inline void prst_pool_init(PrstPool *p) {
     p->entries = (PrstEntry *)malloc(sizeof(PrstEntry) * PRST_POOL_INIT_CAP);
     p->count   = 0;
@@ -42,11 +48,10 @@ static inline void prst_pool_init(PrstPool *p) {
 static inline void prst_pool_free(PrstPool *p) {
     if (!p->entries) return;
     for (int i = 0; i < p->count; i++) {
-        /* prst_pool_set now stores fully independent deep clones for
-         * both value and init_value, so each must be freed separately
-         * and recursively. */
-        value_free_data(&p->entries[i].value);
-        value_free_data(&p->entries[i].init_value);
+        /* Free only what prst_pool_set's deep_clone actually allocated —
+         * never VAL_DYN (GC) or VAL_BLOCK_INST (block_registry). */
+        prst_value_free_clone(&p->entries[i].value);
+        prst_value_free_clone(&p->entries[i].init_value);
     }
     free(p->entries);
     p->entries = NULL;
@@ -65,10 +70,10 @@ static inline int prst_pool_find(PrstPool *p, const char *name) {
  * the source: every VAL_STRING is strdup'd, every VAL_ARR has its own
  * malloc'd buffer, and any nested VAL_ARR is itself deep-cloned.
  *
- * VAL_DYN is not cloned — `dyn` is a heap-only type owned by the GC and
- * never appears in the prst wire format. Other types (primitives,
- * VAL_PTR, VAL_BLOCK_INST, VAL_FUNC) carry no owned pointers, so the
- * shallow struct copy is sufficient. */
+ * VAL_DYN, VAL_BLOCK_INST, VAL_PTR, VAL_FUNC and primitives are shallow
+ * copies — VAL_DYN is GC-managed, VAL_BLOCK_INST lives in the global
+ * block registry, VAL_PTR is opaque, VAL_FUNC points into the AST pool,
+ * and primitives carry no heap pointer. The pool does not own them. */
 static inline Value prst_value_deep_clone(const Value *src) {
     Value dst = *src;
     if (src->type == VAL_STRING && src->as.string) {
@@ -87,6 +92,27 @@ static inline Value prst_value_deep_clone(const Value *src) {
         }
     }
     return dst;
+}
+
+/* Mirror of prst_value_deep_clone — frees only what the clone allocated.
+ * Crucially, this does NOT touch VAL_DYN or VAL_BLOCK_INST: the GC and
+ * the block registry respectively own those, and freeing them here
+ * would double-free across reload boundaries (runtime stores the same
+ * dyn pointer in scope and pool; GC sweeps it after handover). */
+static inline void prst_value_free_clone(Value *v) {
+    if (!v) return;
+    if (v->type == VAL_STRING && v->as.string) {
+        free(v->as.string);
+        v->as.string = NULL;
+    } else if (v->type == VAL_ARR && v->as.arr.data && v->as.arr.owned) {
+        for (int i = 0; i < v->as.arr.size; i++)
+            prst_value_free_clone(&v->as.arr.data[i]);
+        free(v->as.arr.data);
+        v->as.arr.data  = NULL;
+        v->as.arr.size  = 0;
+        v->as.arr.owned = 0;
+    }
+    /* VAL_DYN, VAL_BLOCK_INST, primitives: not owned by the pool. */
 }
 
 /* Set a prst variable.
@@ -108,7 +134,7 @@ static inline int prst_pool_set(PrstPool *p, const char *name,
         /* Free the old value (string + any owned array data) and replace
          * with an independent deep clone of `value`. init_value is
          * preserved — only the runtime value is being updated. */
-        value_free_data(&p->entries[idx].value);
+        prst_value_free_clone(&p->entries[idx].value);
         p->entries[idx].value = prst_value_deep_clone(&value);
         return idx;
     }
@@ -441,11 +467,15 @@ static inline int prst_pool_deserialize(PrstPool *p,
             p->entries[idx].declared_type = (ValType)dt;
             p->entries[idx].stack_offset  = (int)so;
             /* Restore init_value from wire. prst_pool_set has stored an
-             * independent deep clone in init_value; free it and take
-             * ownership of iv_val instead — that is what the snapshot
-             * encoded, and it is the key to correct reload-detection
-             * (source-edit invalidation) on the next reload. */
-            value_free_data(&p->entries[idx].init_value);
+             * independent deep clone in init_value; free its allocations
+             * and take ownership of iv_val instead — that is what the
+             * snapshot encoded, and it is the key to correct
+             * reload-detection (source-edit invalidation) on the next
+             * reload. iv_val itself comes from prst_deser_value and
+             * carries only string/arr (never VAL_DYN/VAL_BLOCK_INST), so
+             * value_free_data on it later would also be safe — but use
+             * the clone-specific free for consistency. */
+            prst_value_free_clone(&p->entries[idx].init_value);
             p->entries[idx].init_value = iv_val;
         } else {
             /* prst_pool_set rejected v (type collision). iv_val was never
