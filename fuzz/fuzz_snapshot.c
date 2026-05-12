@@ -87,32 +87,8 @@ static void touch_graph(const PrstGraph *g) {
     }
 }
 
-/* Free any value-internal allocations that prst_pool_free leaves behind.
- * prst_pool_free only frees VAL_STRING in `value` — not in `init_value`,
- * and not VAL_ARR.data anywhere. Without this, even a clean run leaks. */
-static void deep_free_pool(PrstPool *p) {
-    for (int i = 0; i < p->count; i++) {
-        Value *vs[2] = { &p->entries[i].value, &p->entries[i].init_value };
-        for (int k = 0; k < 2; k++) {
-            Value *v = vs[k];
-            if (v->type == VAL_STRING && v->as.string) {
-                free(v->as.string);
-                v->as.string = NULL;
-            }
-            if (v->type == VAL_ARR && v->as.arr.data) {
-                for (int j = 0; j < v->as.arr.size; j++) {
-                    Value *e = &v->as.arr.data[j];
-                    if (e->type == VAL_STRING && e->as.string) free(e->as.string);
-                    if (e->type == VAL_ARR && e->as.arr.data)  free(e->as.arr.data);
-                }
-                free(v->as.arr.data);
-                v->as.arr.data = NULL;
-                v->as.arr.size = 0;
-            }
-        }
-    }
-    prst_pool_free(p);  /* frees the entries array */
-}
+/* prst_pool_free now recursively reclaims value and init_value for
+ * every entry (see src/prst_pool.h). The harness just calls it. */
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     /* Cap at a generous size — recursion depth in VAL_ARR can hit the
@@ -128,7 +104,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (prst_pool_deserialize(&p, body, blen)) {
             touch_pool(&p);
         }
-        deep_free_pool(&p);
+        prst_pool_free(&p);
         return 0;
     }
 
@@ -175,7 +151,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         touch_graph(&g);
     }
 
-    deep_free_pool(&p);
+    prst_pool_free(&p);
     prst_graph_free(&g);
     return 0;
 }
