@@ -284,7 +284,9 @@ static inline int prst_pool_serialize(const PrstPool *p,
     return 1;
 }
 
-/* Helper: read one Value from wire buffer */
+/* Helper: read one Value from wire buffer.
+ * On NULL return, any partial allocation inside *out has already been
+ * freed — callers can treat *out as untouched. */
 static inline const char *prst_deser_value(const char *r, const char *end,
                                             ValType dt, Value *out) {
     if (r + sizeof(int64_t) + sizeof(double) + sizeof(int32_t)*2 > end) return NULL;
@@ -310,13 +312,35 @@ static inline const char *prst_deser_value(const char *r, const char *end,
     int32_t arr_count; memcpy(&arr_count, r, sizeof(int32_t)); r += sizeof(int32_t);
     if (arr_count > 0 && dt == VAL_ARR) {
         Value *data = (Value*)calloc((size_t)arr_count, sizeof(Value));
-        if (!data) return NULL;
+        if (!data) {
+            if (out->type == VAL_STRING && out->as.string) {
+                free(out->as.string); out->as.string = NULL;
+            }
+            out->type = VAL_NIL;
+            return NULL;
+        }
         for (int _ai = 0; _ai < arr_count; _ai++) {
-            if (r + (int)sizeof(int32_t) > end) { free(data); return NULL; }
+            if (r + (int)sizeof(int32_t) > end) {
+                for (int _j = 0; _j < _ai; _j++) value_free_data(&data[_j]);
+                free(data);
+                if (out->type == VAL_STRING && out->as.string) {
+                    free(out->as.string); out->as.string = NULL;
+                }
+                out->type = VAL_NIL;
+                return NULL;
+            }
             int32_t etag; memcpy(&etag, r, sizeof(int32_t)); r += sizeof(int32_t);
             Value elem; memset(&elem, 0, sizeof(elem));
             r = prst_deser_value(r, end, (ValType)etag, &elem);
-            if (!r) { free(data); return NULL; }
+            if (!r) {
+                for (int _j = 0; _j < _ai; _j++) value_free_data(&data[_j]);
+                free(data);
+                if (out->type == VAL_STRING && out->as.string) {
+                    free(out->as.string); out->as.string = NULL;
+                }
+                out->type = VAL_NIL;
+                return NULL;
+            }
             data[_ai] = elem;
         }
         out->type         = VAL_ARR;
@@ -324,15 +348,15 @@ static inline const char *prst_deser_value(const char *r, const char *end,
         out->as.arr.size  = (int)arr_count;
         out->as.arr.owned = 1;
     } else if (arr_count > 0) {
-        /* non-ARR type: skip element blocks for forward compat */
+        /* non-ARR type: skip element blocks for forward compat. The skipped
+         * values are not retained, so free everything they allocated. */
         for (int _ai = 0; _ai < arr_count; _ai++) {
             if (r + (int)sizeof(int32_t) > end) return NULL;
             int32_t etag; memcpy(&etag, r, sizeof(int32_t)); r += sizeof(int32_t);
             Value skip; memset(&skip, 0, sizeof(skip));
             r = prst_deser_value(r, end, (ValType)etag, &skip);
             if (!r) return NULL;
-            if (skip.type == VAL_STRING && skip.as.string) free(skip.as.string);
-            if (skip.type == VAL_ARR && skip.as.arr.data)  free(skip.as.arr.data);
+            value_free_data(&skip);
         }
     }
     return r;
@@ -368,24 +392,32 @@ static inline int prst_pool_deserialize(PrstPool *p,
         /* init_value (declared default at first run) */
         Value iv_val = {0};
         r = prst_deser_value(r, end, (ValType)dt, &iv_val);
-        if (!r) return 0;
+        if (!r) { value_free_data(&v); return 0; }
 
         int idx = prst_pool_set(p, name, v, NULL);
         if (idx >= 0) {
             p->entries[idx].declared_type = (ValType)dt;
             p->entries[idx].stack_offset  = (int)so;
             /* Restore init_value from wire — this is the key to correct
-             * reload detection: the source default that was declared at first run. */
+             * reload detection: the source default that was declared at first run.
+             *
+             * prst_pool_set's `init_value = value` is a shallow copy: the
+             * .as.arr.data pointer is shared with .value.as.arr.data, and
+             * the .as.string was explicitly re-strdup'd to be unique. Free
+             * only the safely-unique fields (string) before overwriting —
+             * never the shared array data. */
             if (p->entries[idx].init_value.type == VAL_STRING &&
                 p->entries[idx].init_value.as.string)
                 free(p->entries[idx].init_value.as.string);
             p->entries[idx].init_value = iv_val;
         } else {
-            /* Free strings if not stored */
-            if (iv_val.type == VAL_STRING && iv_val.as.string)
-                free(iv_val.as.string);
+            /* prst_pool_set rejected v (type collision). iv_val was never
+             * stored; free everything it allocated. */
+            value_free_data(&iv_val);
         }
-        if (v.type == VAL_STRING && v.as.string) free(v.as.string);
+        /* prst_pool_set deep-copies VAL_STRING and VAL_ARR into the pool
+         * entry — the originals in `v` are now orphans. Reclaim them. */
+        value_free_data(&v);
     }
     return 1;
 }
