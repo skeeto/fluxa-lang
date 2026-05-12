@@ -175,6 +175,7 @@ static inline void cfg_parse_sig(const char *sig_str, FfiSigEntry *out) {
 
     /* params: between ( and last ) before -> */
     const char *open  = strchr(sig_str, '(');
+    if (!open) return;
     /* find the ) that closes the param list — search backwards from arrow or end */
     const char *close = NULL;
     {
@@ -183,7 +184,7 @@ static inline void cfg_parse_sig(const char *sig_str, FfiSigEntry *out) {
             if (*p == ')') { close = p; break; }
         }
     }
-    if (!open || !close || close <= open) return;
+    if (!close || close <= open) return;
 
     char inner[512];
     int inner_len = (int)(close - open - 1);
