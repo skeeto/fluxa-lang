@@ -101,6 +101,9 @@ static inline const char *json_read_string(const char *p, char *buf, int buf_siz
     while (*p && *p != '"' && i < buf_size - 1) {
         if (*p == '\\') {
             p++;
+            /* Trailing '\\' with no escape char — stop before reading and
+             * advancing past the source's null terminator. */
+            if (*p == '\0') break;
             switch (*p) {
                 case '"':  buf[i++] = '"';  break;
                 case '\\': buf[i++] = '\\'; break;
